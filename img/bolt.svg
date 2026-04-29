@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1a1b26"/>
+      <stop offset="100%" style="stop-color:#0a0a14"/>
+    </linearGradient>
+    <linearGradient id="word-grad" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" style="stop-color:#7aa2f7"/>
+      <stop offset="100%" style="stop-color:#bd93f9"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Same circular frame as the rest of the suite -->
+  <circle cx="128" cy="128" r="120" fill="url(#bg)" stroke="url(#word-grad)" stroke-width="3"/>
+
+  <!-- Padlock shackle (the U at the top) -->
+  <path d="M 92 92 L 92 72 A 36 36 0 0 1 164 72 L 164 92"
+        fill="none" stroke="#7aa2f7" stroke-width="9" stroke-linecap="round" opacity="0.95"/>
+
+  <!-- Padlock body -->
+  <rect x="74" y="92" width="108" height="84" rx="10" ry="10"
+        fill="#24283b" stroke="#bd93f9" stroke-width="2"/>
+
+  <!-- Lightning bolt running through the body -->
+  <path d="M 138 102 L 108 142 L 128 142 L 118 174 L 152 134 L 132 134 Z"
+        fill="#e0af68" stroke="#1a1b26" stroke-width="1.5" stroke-linejoin="round"/>
+
+  <!-- Wordmark -->
+  <text x="128" y="216" font-family="monospace" font-size="28" font-weight="bold"
+        fill="#7aa2f7" text-anchor="middle" letter-spacing="3">bolt</text>
+</svg>

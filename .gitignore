@@ -1,0 +1,5 @@
+bolt
+bolt-auth
+*.o
+img/logo.rgba
+img/logo.dim

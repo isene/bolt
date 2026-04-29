@@ -1,0 +1,35 @@
+# bolt — example ~/.lockrc
+#
+# Drop this at $HOME/.lockrc (or just leave bolt with its compiled-in
+# defaults). Lines beginning with '#' are comments. Unrecognised keys
+# are silently ignored, so configs are forward-compatible.
+
+# ---- Background ------------------------------------------------------------
+# Solid colour shown when no image is set or the image fails to load.
+# Format: 0xRRGGBB (alpha is forced opaque). Defaults to 0x1a1b26.
+bg_color = 0x1a1b26
+
+# Optional: path to a raw RGB image matching your screen geometry.
+# Bake one with ImageMagick:
+#   convert wallpaper.jpg -resize 1920x1080! -depth 8 RGB:~/.lockbg.rgb
+# Or with ffmpeg:
+#   ffmpeg -i wallpaper.jpg -vf scale=1920:1080 -f rawvideo -pix_fmt rgb24 ~/.lockbg.rgb
+# The file must be exactly width*height*3 bytes. Larger / smaller files
+# trigger the bg_color fallback. Comment out or leave blank to skip.
+# bg_image = /home/you/.lockbg.rgb
+
+# ---- Foreground colours ---------------------------------------------------
+# Password-dot colour. Defaults to 0x88c0d0 (Nord frost).
+accent = 0x88c0d0
+
+# Tagline / fallback text colour. Defaults to 0xd8dee9.
+text_color = 0xd8dee9
+
+# ---- Tagline --------------------------------------------------------------
+# Single-line text drawn under the logo. Defaults to "Make it Simple".
+tagline = Make it Simple
+
+# ---- Font -----------------------------------------------------------------
+# X11 core-font name (XLFD) for the tagline. Anything XLoadFont accepts.
+# Defaults to a dependable fixed-bold: "-*-fixed-bold-r-normal-*-20-*-*-*-*-*-*-*"
+# font = -*-dejavu sans mono-bold-r-normal-*-20-*-*-*-*-*-*-*
