@@ -33,6 +33,10 @@ DEFAULT REL
 %define SYS_EXIT        60
 %define SYS_WAIT4       61
 %define SYS_KILL        62
+%define SYS_FCNTL       72
+%define F_SETFL         4
+%define O_NONBLOCK      0x800
+%define WNOHANG         1
 %define SYS_SOCKET      41
 %define SYS_CONNECT     42
 
@@ -2460,6 +2464,17 @@ fp_start:
     mov rax, SYS_CLOSE
     mov edi, r12d
     syscall
+    ; Set the read end non-blocking so the drain loop in fp_check_exit
+    ; can't wedge on a child that's alive but not currently writing.
+    ; Without this, fprintd-verify prints status messages periodically;
+    ; we wake on POLLIN, drain what's there, then read() blocks again
+    ; until the next chatter or until the child exits — which means
+    ; bolt never reaps the zombie and the user never gets a respawn.
+    mov rax, SYS_FCNTL
+    mov edi, ebx
+    mov esi, F_SETFL
+    mov edx, O_NONBLOCK
+    syscall
     pop r13
     pop r12
     pop rbx
@@ -2527,7 +2542,9 @@ fp_stop:
 fp_check_exit:
     cmp byte [fp_active], 0
     je .fpc_zero
-    ; Drain remaining pipe bytes into tmp_buf, non-blocking.
+    ; Drain remaining pipe bytes into tmp_buf. Pipe is non-blocking
+    ; (set in fp_start) so read returns -EAGAIN once the buffer is
+    ; empty even if the child is still alive.
 .fpc_drain:
     mov rax, SYS_READ
     mov edi, [fp_pipe_rd]
@@ -2536,17 +2553,20 @@ fp_check_exit:
     syscall
     cmp rax, 0
     jg .fpc_drain                       ; got bytes, keep going
-    ; rax == 0 → EOF (child closed pipe). rax < 0 → would block / error.
-    ; Either way, check exit status.
+    ; rax == 0 → EOF (child closed pipe). rax < 0 → EAGAIN or error.
+    ; Use wait4 with WNOHANG to find out whether the child has actually
+    ; exited; if it hasn't, just return 0 and let the next poll cycle
+    ; deliver the next batch of bytes / the eventual EOF.
     sub rsp, 16
     mov rax, SYS_WAIT4
     mov edi, [fp_pid]
     mov rsi, rsp
-    xor edx, edx                        ; no flags = block
+    mov edx, WNOHANG
     xor r10d, r10d
     syscall
-    test rax, rax
-    js .fpc_after_wait_fail
+    test eax, eax
+    jz .fpc_alive_sp                    ; rax==0 → child still alive
+    js .fpc_after_wait_fail             ; -1 → wait error
     mov ecx, [rsp]                      ; wstatus
     add rsp, 16
     ; Mark inactive regardless of outcome — we just reaped it.
@@ -2562,12 +2582,26 @@ fp_check_exit:
     mov dword [fp_pid], 0
     mov dword [fp_pipe_rd], 0
     ; wstatus & 0xff == 0 means normal exit; high byte is exit code.
-    test ecx, 0xff
-    jnz .fpc_zero                       ; signaled / weird — treat as failure
+    ; fprintd-verify is a one-shot: it waits ~10s for a touch then
+    ; exits 1 with "verify-no-match" if nothing arrived. To keep the
+    ; reader armed for the entire lock duration we respawn the child
+    ; on any non-match exit; the user gets continuous fingerprint
+    ; coverage instead of a 10-second window at lock-start.
+    test ecx, 0x7f
+    jnz .fpc_respawn                    ; signaled — likely system shutdown,
+                                        ; respawn anyway (fp_start tolerates it)
     shr ecx, 8
     test ecx, ecx
-    jnz .fpc_zero                       ; non-zero exit → no match
-    mov eax, 1
+    jnz .fpc_respawn                    ; non-zero exit → no match yet
+    mov eax, 1                          ; status 0 → matched, unlock
+    ret
+.fpc_respawn:
+    call fp_start                       ; relaunch fprintd-verify
+    xor eax, eax
+    ret
+.fpc_alive_sp:
+    add rsp, 16
+    xor eax, eax
     ret
 .fpc_after_wait_fail:
     add rsp, 16
