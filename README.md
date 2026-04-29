@@ -25,6 +25,8 @@ Part of the [CHasm](https://github.com/isene/chasm) suite alongside
 
 <br clear="left"/>
 
+![bolt lock screen](img/screenshot.png)
+
 The split keeps the audit-able privileged code small and language-boring,
 while the locker UI stays in the asm style of the rest of the suite.
 
