@@ -143,6 +143,16 @@ max_keycode:            resd 1
 keysyms_per_keycode:    resd 1
 keymap_buf:             resd 8192           ; 32768 bytes — generous for any real keymap
 
+; ---- Fingerprint verifier subprocess --------------------------------------
+; Spawned once at lock start (fork → exec /usr/bin/fprintd-verify). The
+; event loop poll()s its stdout pipe so a touch on the reader can unlock
+; without the user typing a password. fp_pid==0 means no fingerprint
+; child running (either disabled, or it already exited).
+fp_pid:                 resd 1              ; child pid (0 = none)
+fp_pipe_rd:             resd 1              ; pipe read end (we discard the bytes)
+fp_active:              resb 1              ; 1 while the child is alive
+                        resb 7              ; pad
+
 ; Logo blob mmap'd from img/logo.rgba (set up at install time).
 logo_addr:              resq 1
 logo_size:              resq 1
@@ -216,6 +226,13 @@ default_font_name_len   equ $ - default_font_name - 1
 bolt_auth_path:         db "/usr/local/bin/bolt-auth", 0
 bolt_auth_argv:         dq bolt_auth_path
                         dq 0
+
+; Fingerprint verifier — fprintd-verify is a stock dbus client to fprintd.
+; Exits 0 on a matching touch, non-zero on mismatch / kill / no enrolment.
+fp_path:                db "/usr/bin/fprintd-verify", 0
+fp_argv:                dq fp_path
+                        dq 0
+devnull_path:           db "/dev/null", 0
 
 err_no_display:         db "bolt: cannot connect to X server", 10
 err_no_display_len      equ $ - err_no_display
@@ -322,9 +339,14 @@ _start:
     jnz .die_grab
 
     call render_screen
+    ; Spawn fprintd-verify in the background so a fingerprint touch
+    ; can unlock without typing. Falls through silently on systems
+    ; without fprintd installed.
+    call fp_start
     call event_loop
 
     ; event_loop returns on success.
+    call fp_stop                          ; kill fingerprint child if still alive
     call ungrab_input
     mov rax, SYS_EXIT
     xor edi, edi
@@ -2352,12 +2374,253 @@ put_image_rgba:
     ret
 
 ; ----------------------------------------------------------------------------
+; ----------------------------------------------------------------------------
+; fp_start — fork + exec /usr/bin/fprintd-verify so a fingerprint touch
+; can unlock the screen without the user typing a password. Returns
+; with fp_pid + fp_pipe_rd populated, or zeroed if anything went wrong
+; (no fprintd installed, fork failed, etc.). The lock screen still
+; works in that case — we just rely on the password path.
+;
+; The child's stdout/stderr go into a pipe we own; we don't actually
+; read the bytes (fprintd-verify prints chatty status), but EOF on
+; read tells us the child exited so the event loop can waitpid+check
+; the exit code without busy-waiting.
+; ----------------------------------------------------------------------------
+fp_start:
+    push rbx
+    push r12
+    push r13
+    ; pipe(2)
+    sub rsp, 16
+    mov rax, SYS_PIPE
+    mov rdi, rsp
+    syscall
+    test rax, rax
+    js .fp_fail_sp
+    mov ebx, [rsp]                      ; read end (parent keeps)
+    mov r12d, [rsp + 4]                 ; write end (goes to child)
+    add rsp, 16
+
+    mov rax, SYS_FORK
+    syscall
+    test rax, rax
+    js .fp_fail_pipes
+    jnz .fp_parent
+
+    ; --- child ---
+    ; dup2(write_end, 1) and dup2(write_end, 2) so fprintd-verify's
+    ; chatter goes into our pipe; close stdin (open /dev/null over
+    ; fd 0 so the child has a valid stdin if it reads).
+    mov rax, SYS_DUP2
+    mov edi, r12d
+    mov esi, 1
+    syscall
+    mov rax, SYS_DUP2
+    mov edi, r12d
+    mov esi, 2
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, ebx
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, r12d
+    syscall
+    ; Replace stdin with /dev/null.
+    mov rax, SYS_OPEN
+    lea rdi, [devnull_path]
+    xor esi, esi                        ; O_RDONLY
+    syscall
+    test rax, rax
+    js .fp_child_skip_stdin
+    mov r13, rax
+    mov rax, SYS_DUP2
+    mov edi, r13d
+    xor esi, esi
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, r13d
+    syscall
+.fp_child_skip_stdin:
+    mov rax, SYS_EXECVE
+    lea rdi, [fp_path]
+    lea rsi, [fp_argv]
+    mov rdx, [envp]
+    syscall
+    ; exec failed (fprintd-verify not installed) — die quietly so
+    ; bolt doesn't fall over.
+    mov rax, SYS_EXIT
+    mov edi, 127
+    syscall
+
+.fp_parent:
+    mov [fp_pid], eax                   ; save child pid
+    mov [fp_pipe_rd], ebx               ; pipe read end
+    mov byte [fp_active], 1
+    ; close write end in parent
+    mov rax, SYS_CLOSE
+    mov edi, r12d
+    syscall
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+.fp_fail_sp:
+    add rsp, 16
+.fp_fail_pipes:
+    mov dword [fp_pid], 0
+    mov dword [fp_pipe_rd], 0
+    mov byte [fp_active], 0
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; fp_stop — best-effort cleanup: kill the fp child if it's still alive,
+; reap, close pipe. Called on unlock and on auth-failure restart paths.
+; ----------------------------------------------------------------------------
+fp_stop:
+    cmp byte [fp_active], 0
+    je .fps_done
+    mov byte [fp_active], 0
+    ; SIGTERM (15) the child if pid > 0
+    mov eax, dword [fp_pid]
+    test eax, eax
+    jz .fps_close_pipe
+    mov rax, SYS_KILL
+    mov edi, [fp_pid]
+    mov esi, 15
+    syscall
+    ; reap (blocking — child should exit fast on SIGTERM)
+    sub rsp, 16
+    mov rax, SYS_WAIT4
+    mov edi, [fp_pid]
+    mov rsi, rsp
+    xor edx, edx
+    xor r10d, r10d
+    syscall
+    add rsp, 16
+.fps_close_pipe:
+    mov eax, [fp_pipe_rd]
+    test eax, eax
+    jz .fps_zero
+    mov rax, SYS_CLOSE
+    mov edi, [fp_pipe_rd]
+    syscall
+.fps_zero:
+    mov dword [fp_pid], 0
+    mov dword [fp_pipe_rd], 0
+.fps_done:
+    ret
+
+; ----------------------------------------------------------------------------
+; fp_check_exit — if the fp child has exited and matched (status 0),
+; return rax=1 (caller should unlock). Status non-zero (rejection,
+; SIGTERM, no enrolment) → rax=0 and fp_active flips off so the event
+; loop stops polling that pipe.
+;
+; Called when poll() reports POLLIN/POLLHUP on fp_pipe_rd. Drains any
+; pending bytes (fprintd-verify chatter) before checking exit so a
+; final flush from the child doesn't wedge poll on the next iteration.
+; ----------------------------------------------------------------------------
+fp_check_exit:
+    cmp byte [fp_active], 0
+    je .fpc_zero
+    ; Drain remaining pipe bytes into tmp_buf, non-blocking.
+.fpc_drain:
+    mov rax, SYS_READ
+    mov edi, [fp_pipe_rd]
+    lea rsi, [tmp_buf]
+    mov rdx, 4096
+    syscall
+    cmp rax, 0
+    jg .fpc_drain                       ; got bytes, keep going
+    ; rax == 0 → EOF (child closed pipe). rax < 0 → would block / error.
+    ; Either way, check exit status.
+    sub rsp, 16
+    mov rax, SYS_WAIT4
+    mov edi, [fp_pid]
+    mov rsi, rsp
+    xor edx, edx                        ; no flags = block
+    xor r10d, r10d
+    syscall
+    test rax, rax
+    js .fpc_after_wait_fail
+    mov ecx, [rsp]                      ; wstatus
+    add rsp, 16
+    ; Mark inactive regardless of outcome — we just reaped it.
+    mov byte [fp_active], 0
+    ; Close pipe and zero pid so subsequent fp_stop calls are no-ops.
+    mov eax, [fp_pipe_rd]
+    test eax, eax
+    jz .fpc_after_close
+    mov rax, SYS_CLOSE
+    mov edi, [fp_pipe_rd]
+    syscall
+.fpc_after_close:
+    mov dword [fp_pid], 0
+    mov dword [fp_pipe_rd], 0
+    ; wstatus & 0xff == 0 means normal exit; high byte is exit code.
+    test ecx, 0xff
+    jnz .fpc_zero                       ; signaled / weird — treat as failure
+    shr ecx, 8
+    test ecx, ecx
+    jnz .fpc_zero                       ; non-zero exit → no match
+    mov eax, 1
+    ret
+.fpc_after_wait_fail:
+    add rsp, 16
+    mov byte [fp_active], 0
+.fpc_zero:
+    xor eax, eax
+    ret
+
+; ----------------------------------------------------------------------------
 ; event_loop — read events, dispatch on type. Returns when password
 ; verification succeeds.
 ; ----------------------------------------------------------------------------
 event_loop:
 .el_top:
     call x11_flush
+    ; Build a pollfd array on the stack:
+    ;   slot 0: x11_fd, POLLIN
+    ;   slot 1: fp_pipe_rd, POLLIN  (only included while fp_active)
+    sub rsp, 16
+    mov eax, [x11_fd]
+    mov [rsp], eax
+    mov word [rsp + 4], 1                 ; POLLIN
+    mov word [rsp + 6], 0
+    mov esi, 1                            ; nfds (start with X11 only)
+    cmp byte [fp_active], 0
+    je .el_poll_call
+    mov eax, [fp_pipe_rd]
+    mov [rsp + 8], eax
+    mov word [rsp + 12], 1                ; POLLIN
+    mov word [rsp + 14], 0
+    mov esi, 2                            ; nfds (X11 + fp pipe)
+.el_poll_call:
+    mov rax, SYS_POLL
+    lea rdi, [rsp]
+    mov edx, -1                           ; block indefinitely
+    syscall
+    ; Inspect revents BEFORE dropping the stack frame.
+    test rax, rax
+    js .el_poll_done                      ; signal/error — restart loop
+    movzx ecx, word [rsp + 6]             ; X11 revents
+    movzx r8d, word [rsp + 14]            ; fp pipe revents
+.el_poll_done:
+    add rsp, 16
+    test r8d, r8d
+    jz .el_after_fp
+    ; Pipe wakeup: child wrote bytes or exited. Drain + check status.
+    call fp_check_exit
+    test eax, eax
+    jnz .el_unlock                        ; fingerprint matched
+.el_after_fp:
+    test ecx, ecx
+    jz .el_top                            ; nothing on X11 yet
+    ; Read one X11 event.
     mov rax, SYS_READ
     mov rdi, [x11_fd]
     lea rsi, [ev_buf]

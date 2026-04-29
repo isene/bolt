@@ -55,6 +55,16 @@ and hit Enter:
 - wrong → squares clear, lock screen stays up.
 - `Esc` clears the typed buffer; `Backspace` removes one byte.
 
+**Fingerprint:** if `/usr/bin/fprintd-verify` is installed and you have
+an enrolled finger (`fprintd-list $USER`), bolt forks it as a sibling
+auth process at lock-start. A matching touch unlocks the screen
+without typing — bolt's `poll(2)` loop watches the fprintd child's
+stdout pipe, reaps the child on EOF, and unlocks if it exited 0. The
+password path runs in parallel; whichever signals success first wins.
+On unlock bolt sends `SIGTERM` to the fingerprint child so the reader
+goes cold immediately. Systems without fprintd installed silently fall
+through to the password-only path.
+
 Trigger from your window manager. For tile (`~/.tilerc`):
 
 ```
