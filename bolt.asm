@@ -238,6 +238,23 @@ fp_argv:                dq fp_path
                         dq 0
 devnull_path:           db "/dev/null", 0
 
+fp_msg_spawn:           db "bolt-fp: child spawned, fingerprint reader armed", 10
+fp_msg_spawn_len        equ $ - fp_msg_spawn
+; Substring we scan for in the child's stdout to detect a match the
+; instant fprintd reports it — saves the 1-5s the Goodix-class readers
+; spend in their device-release cycle before fprintd-verify finally
+; exits. "verify-no-match" doesn't contain "verify-match" as a
+; substring (the "-no-" in the middle breaks the 7th byte), so
+; this 12-byte literal uniquely identifies success.
+fp_match_marker:        db "verify-match"
+fp_match_marker_len     equ $ - fp_match_marker
+fp_msg_fail:            db "bolt-fp: spawn FAILED (no /usr/bin/fprintd-verify? pipe/fork err?)", 10
+fp_msg_fail_len         equ $ - fp_msg_fail
+fp_msg_match:           db "bolt-fp: MATCH — unlocking", 10
+fp_msg_match_len        equ $ - fp_msg_match
+fp_msg_respawn:         db "bolt-fp: child exited (no match / timeout) — respawning", 10
+fp_msg_respawn_len      equ $ - fp_msg_respawn
+
 err_no_display:         db "bolt: cannot connect to X server", 10
 err_no_display_len      equ $ - err_no_display
 
@@ -342,16 +359,70 @@ _start:
     test rax, rax
     jnz .die_grab
 
-    call render_screen
     ; Spawn fprintd-verify in the background so a fingerprint touch
     ; can unlock without typing. Falls through silently on systems
-    ; without fprintd installed.
+    ; without fprintd installed. Render AFTER fp_start so the armed
+    ; indicator appears in the first frame.
     call fp_start
+    call render_screen
     call event_loop
 
     ; event_loop returns on success.
     call fp_stop                          ; kill fingerprint child if still alive
     call ungrab_input
+    ; Explicitly unmap + destroy our window before SYS_EXIT so the X
+    ; server sends Expose events to the underlying windows
+    ; immediately. Without this, the kernel-driven socket close gets
+    ; queued behind whatever the server is doing, and the lock
+    ; window's pixels stay on screen until the next unrelated wake
+    ; (a keystroke, the user moving the mouse, etc.). The user saw
+    ; this as "fp matched, screen still locked, press Shift and it
+    ; unlocks instantly."
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_DESTROY_WINDOW   ; opcode 4
+    mov byte [rdi + 1], 0
+    mov word [rdi + 2], 2
+    mov eax, [win_id]
+    mov [rdi + 4], eax
+    lea rsi, [tmp_buf]
+    mov rdx, 8
+    call x11_buffer
+    inc dword [x11_seq]
+    ; XSync via GetInputFocus: a reply-bearing request guarantees the
+    ; server has finished processing every preceding request (ungrab
+    ; keyboard, ungrab pointer, destroy window) before the reply
+    ; arrives. Without this the server may still be holding our
+    ; ungrabs in its input queue when bolt SYS_EXITs — keyboard grab
+    ; lingers, key events don't flow to other apps, and the screen
+    ; stays visually frozen on the lock content until the user
+    ; presses something that finally breaks the queue. With the sync,
+    ; all our state changes are committed at the server before we
+    ; tear down.
+    lea rdi, [tmp_buf]
+    mov byte [rdi], 43                   ; X11_GET_INPUT_FOCUS
+    mov byte [rdi + 1], 0
+    mov word [rdi + 2], 1                ; request length = 1 word
+    lea rsi, [tmp_buf]
+    mov rdx, 4
+    call x11_buffer
+    inc dword [x11_seq]
+    call x11_flush
+.exit_drain_reply:
+    mov rax, SYS_READ
+    mov rdi, [x11_fd]
+    lea rsi, [tmp_buf]
+    mov rdx, 32
+    syscall
+    cmp rax, 32
+    jl .exit_done_drain
+    cmp byte [tmp_buf], 1                ; 1 = reply
+    jne .exit_drain_reply                ; not the reply yet — keep reading
+.exit_done_drain:
+    ; Close the X11 socket explicitly so the server sees our
+    ; disconnect before we SYS_EXIT.
+    mov rax, SYS_CLOSE
+    mov rdi, [x11_fd]
+    syscall
     mov rax, SYS_EXIT
     xor edi, edi
     syscall
@@ -1666,16 +1737,28 @@ grab_input:
     call x11_buffer
     inc dword [x11_seq]
     call x11_flush
-    ; Read 32-byte reply.
+    ; Read 32-byte messages and drain events/errors until we find OUR
+    ; reply (byte 0 == 1). Earlier code re-sent GrabKeyboard on every
+    ; non-reply read, which compounded — by the time we mapped the
+    ; window the X server queued MapNotify + ConfigureNotify + Expose
+    ; events ahead of the reply, and the previous loop interpreted
+    ; each one as "grab failed, retry". With unlucky event timing we
+    ; ran out of retries (50 × 100 ms = 5 s) before the reply ever
+    ; got read — manifesting as the ~50 % "first-try fails, screen
+    ; blinks back to desktop" behaviour. Now: drain non-reply
+    ; messages in a tight inner loop, only retry the GrabKeyboard
+    ; request itself when the reply explicitly says "AlreadyGrabbed
+    ; / Frozen / NotViewable / InvalidTime".
+.gi_kbd_read:
     mov rax, SYS_READ
     mov rdi, [x11_fd]
     lea rsi, [tmp_buf]
     mov rdx, 32
     syscall
     cmp rax, 32
-    jl .gi_fail
-    cmp byte [tmp_buf], 1           ; reply
-    jne .gi_keep_trying
+    jl .gi_keep_trying
+    cmp byte [tmp_buf], 1           ; 1 = reply, 0 = error, >1 = event
+    jne .gi_kbd_read                ; not our reply yet — drain & retry read
     cmp byte [tmp_buf + 1], 0       ; status: 0 = Success
     je .gi_kbd_ok
 .gi_keep_trying:
@@ -1713,6 +1796,9 @@ grab_input:
     call x11_buffer
     inc dword [x11_seq]
     call x11_flush
+    ; Same drain-until-reply pattern as the keyboard grab — the
+    ; X server may have more queued events ahead of our reply.
+.gi_ptr_read:
     mov rax, SYS_READ
     mov rdi, [x11_fd]
     lea rsi, [tmp_buf]
@@ -1721,7 +1807,7 @@ grab_input:
     cmp rax, 32
     jl .gi_fail
     cmp byte [tmp_buf], 1
-    jne .gi_fail
+    jne .gi_ptr_read
     cmp byte [tmp_buf + 1], 0
     jne .gi_fail
     xor eax, eax
@@ -2291,6 +2377,35 @@ render_screen:
     call x11_buffer
     inc dword [x11_seq]
 .rs_done:
+    ; Fingerprint armed indicator: small filled square in the
+    ; bottom-right corner, drawn only while fp_active=1. Gives the
+    ; user a visual confirmation that the reader is listening.
+    ; Disappears briefly during the respawn between failed attempts
+    ; (after a verify-no-match), so a slight pulse signals "your
+    ; touch was processed, here's a fresh attempt window".
+    cmp byte [fp_active], 0
+    je .rs_no_fp_indicator
+    lea rdi, [tmp_buf]
+    mov byte [rdi], X11_POLY_FILL_RECT
+    mov byte [rdi+1], 0
+    mov word [rdi+2], 5
+    mov eax, [win_id]
+    mov [rdi+4], eax
+    mov eax, [gc_fg]
+    mov [rdi+8], eax
+    movzx eax, word [screen_w]
+    sub eax, 24
+    mov word [rdi+12], ax                ; x = screen_w - 24
+    movzx eax, word [screen_h]
+    sub eax, 24
+    mov word [rdi+14], ax                ; y = screen_h - 24
+    mov word [rdi+16], 8
+    mov word [rdi+18], 8
+    lea rsi, [tmp_buf]
+    mov rdx, 20
+    call x11_buffer
+    inc dword [x11_seq]
+.rs_no_fp_indicator:
     call x11_flush
     pop r15
     pop r14
@@ -2460,6 +2575,24 @@ fp_start:
     mov [fp_pid], eax                   ; save child pid
     mov [fp_pipe_rd], ebx               ; pipe read end
     mov byte [fp_active], 1
+    ; Log spawn so the user can verify fp is even being attempted.
+    ; Run bolt from a terminal to see these:
+    ;   bolt 2>&1 | tee /tmp/bolt.log
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [fp_msg_spawn]
+    mov rdx, fp_msg_spawn_len
+    syscall
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
     ; close write end in parent
     mov rax, SYS_CLOSE
     mov edi, r12d
@@ -2486,6 +2619,21 @@ fp_start:
     mov dword [fp_pid], 0
     mov dword [fp_pipe_rd], 0
     mov byte [fp_active], 0
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [fp_msg_fail]
+    mov rdx, fp_msg_fail_len
+    syscall
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
     pop r13
     pop r12
     pop rbx
@@ -2499,23 +2647,30 @@ fp_stop:
     cmp byte [fp_active], 0
     je .fps_done
     mov byte [fp_active], 0
-    ; SIGTERM (15) the child if pid > 0
+    ; SIGKILL the child if pid > 0. Earlier code sent SIGTERM and then
+    ; wait4()'d for the child to exit — but fprintd-verify can spend
+    ; 1-5 s in fingerprint-device cleanup honouring SIGTERM, blocking
+    ; bolt for that whole stretch. Visible symptom was: touch matched,
+    ; bolt detected the match, called fp_stop, then froze for several
+    ; seconds. The user "had to press a key" because the X event queue
+    ; was the only feedback that things were still alive (and even
+    ; that didn't actually do anything — they just happened to be
+    ; pressing as the wait finally returned).
+    ;
+    ; Now: send SIGKILL (which is uninterruptible and reaped by the
+    ; kernel as soon as the process leaves any D-state read), then
+    ; close the pipe and return. We're either about to exit (final
+    ; cleanup path) or we're respawning right after — the orphaned
+    ; zombie either gets reaped by init at our exit, or by the
+    ; respawn-time wait4 in fp_check_exit before fp_start fires the
+    ; next child.
     mov eax, dword [fp_pid]
     test eax, eax
     jz .fps_close_pipe
     mov rax, SYS_KILL
     mov edi, [fp_pid]
-    mov esi, 15
+    mov esi, 9                          ; SIGKILL
     syscall
-    ; reap (blocking — child should exit fast on SIGTERM)
-    sub rsp, 16
-    mov rax, SYS_WAIT4
-    mov edi, [fp_pid]
-    mov rsi, rsp
-    xor edx, edx
-    xor r10d, r10d
-    syscall
-    add rsp, 16
 .fps_close_pipe:
     mov eax, [fp_pipe_rd]
     test eax, eax
@@ -2527,6 +2682,53 @@ fp_stop:
     mov dword [fp_pid], 0
     mov dword [fp_pipe_rd], 0
 .fps_done:
+    ret
+
+; ----------------------------------------------------------------------------
+; fp_scan_match — scan [rdi, rdi+rcx) for the literal "verify-match"
+; (12 bytes). Returns rax=1 if found, 0 otherwise. Linear scan.
+; Clobbers rax, rdx, rdi (advanced past matched start).
+; ----------------------------------------------------------------------------
+fp_scan_match:
+    cmp rcx, fp_match_marker_len
+    jl .fsm_no
+    mov rdx, rcx
+    sub rdx, fp_match_marker_len - 1
+.fsm_loop:
+    test rdx, rdx
+    jz .fsm_no
+    cmp byte [rdi+0], 'v'
+    jne .fsm_skip
+    cmp byte [rdi+1], 'e'
+    jne .fsm_skip
+    cmp byte [rdi+2], 'r'
+    jne .fsm_skip
+    cmp byte [rdi+3], 'i'
+    jne .fsm_skip
+    cmp byte [rdi+4], 'f'
+    jne .fsm_skip
+    cmp byte [rdi+5], 'y'
+    jne .fsm_skip
+    cmp byte [rdi+6], '-'
+    jne .fsm_skip
+    cmp byte [rdi+7], 'm'
+    jne .fsm_skip
+    cmp byte [rdi+8], 'a'
+    jne .fsm_skip
+    cmp byte [rdi+9], 't'
+    jne .fsm_skip
+    cmp byte [rdi+10], 'c'
+    jne .fsm_skip
+    cmp byte [rdi+11], 'h'
+    jne .fsm_skip
+    mov rax, 1
+    ret
+.fsm_skip:
+    inc rdi
+    dec rdx
+    jmp .fsm_loop
+.fsm_no:
+    xor rax, rax
     ret
 
 ; ----------------------------------------------------------------------------
@@ -2542,9 +2744,13 @@ fp_stop:
 fp_check_exit:
     cmp byte [fp_active], 0
     je .fpc_zero
-    ; Drain remaining pipe bytes into tmp_buf. Pipe is non-blocking
-    ; (set in fp_start) so read returns -EAGAIN once the buffer is
-    ; empty even if the child is still alive.
+    ; Drain remaining pipe bytes into tmp_buf, AND forward what we
+    ; read to bolt's stderr (which the tilerc binding redirects to
+    ; /tmp/bolt.log) so fprintd-verify's own status messages
+    ; ("Verify started!", "Verify result: verify-no-match (done)", …)
+    ; show up alongside bolt's own bolt-fp lifecycle prints. Pipe is
+    ; non-blocking (set in fp_start) so read returns -EAGAIN once the
+    ; buffer is empty even if the child is still alive.
 .fpc_drain:
     mov rax, SYS_READ
     mov edi, [fp_pipe_rd]
@@ -2552,7 +2758,33 @@ fp_check_exit:
     mov rdx, 4096
     syscall
     cmp rax, 0
-    jg .fpc_drain                       ; got bytes, keep going
+    jle .fpc_drain_done
+    push rax
+    mov rdx, rax
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [tmp_buf]
+    syscall
+    pop rax
+    ; Early-match check: scan the chunk we just read for "verify-match".
+    ; fprintd reports the result line via dbus immediately, but the
+    ; Goodix-class readers spend 1-5s in device release before the
+    ; child finally exits — that's the visible delay the user reported.
+    ; Detecting the substring lets us unlock the moment fprintd says
+    ; "match" instead of waiting for fprintd-verify's natural exit.
+    push rax
+    push rcx
+    push rdx
+    mov rcx, rax
+    lea rdi, [tmp_buf]
+    call fp_scan_match
+    test rax, rax
+    pop rdx
+    pop rcx
+    pop rax
+    jnz .fpc_early_match
+    jmp .fpc_drain
+.fpc_drain_done:
     ; rax == 0 → EOF (child closed pipe). rax < 0 → EAGAIN or error.
     ; Use wait4 with WNOHANG to find out whether the child has actually
     ; exited; if it hasn't, just return 0 and let the next poll cycle
@@ -2567,11 +2799,15 @@ fp_check_exit:
     test eax, eax
     jz .fpc_alive_sp                    ; rax==0 → child still alive
     js .fpc_after_wait_fail             ; -1 → wait error
-    mov ecx, [rsp]                      ; wstatus
-    add rsp, 16
     ; Mark inactive regardless of outcome — we just reaped it.
     mov byte [fp_active], 0
     ; Close pipe and zero pid so subsequent fp_stop calls are no-ops.
+    ; NB: don't read wstatus from [rsp] until AFTER this close — the
+    ; syscall instruction clobbers rcx, so reading wstatus into ecx
+    ; before the close (then testing ecx after) reads the kernel's
+    ; saved return-PC instead of the wait status. That bug treated
+    ; every successful fingerprint match as a non-zero "no match"
+    ; exit and triggered an endless respawn loop.
     mov eax, [fp_pipe_rd]
     test eax, eax
     jz .fpc_after_close
@@ -2579,6 +2815,8 @@ fp_check_exit:
     mov edi, [fp_pipe_rd]
     syscall
 .fpc_after_close:
+    mov ecx, [rsp]                      ; wstatus (now safe — close done)
+    add rsp, 16
     mov dword [fp_pid], 0
     mov dword [fp_pipe_rd], 0
     ; wstatus & 0xff == 0 means normal exit; high byte is exit code.
@@ -2593,10 +2831,60 @@ fp_check_exit:
     shr ecx, 8
     test ecx, ecx
     jnz .fpc_respawn                    ; non-zero exit → no match yet
-    mov eax, 1                          ; status 0 → matched, unlock
+    ; matched — log + return 1 (caller will unlock)
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [fp_msg_match]
+    mov rdx, fp_msg_match_len
+    syscall
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    mov eax, 1
     ret
 .fpc_respawn:
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [fp_msg_respawn]
+    mov rdx, fp_msg_respawn_len
+    syscall
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    ; fp_active is currently 0 here (cleared at the top of the wait
+    ; reaping path). Render once with the indicator OFF, hold for
+    ; 400 ms so the user actually sees the gap, then fp_start +
+    ; another render brings the dot back. The deliberate pause turns
+    ; what would otherwise be a sub-frame flicker into a clearly
+    ; perceptible "your touch was processed, fresh attempt now"
+    ; signal. The reader is unavailable during the gap anyway
+    ; (between fprintd-verify exits and the next spawn arms it),
+    ; so we're not losing input time.
+    call render_screen
+    sub rsp, 16
+    mov qword [rsp], 0
+    mov qword [rsp + 8], 500000000    ; 500 ms in ns
+    mov rax, SYS_NANOSLEEP
+    mov rdi, rsp
+    xor esi, esi
+    syscall
+    add rsp, 16
     call fp_start                       ; relaunch fprintd-verify
+    call render_screen
     xor eax, eax
     ret
 .fpc_alive_sp:
@@ -2608,6 +2896,29 @@ fp_check_exit:
     mov byte [fp_active], 0
 .fpc_zero:
     xor eax, eax
+    ret
+.fpc_early_match:
+    ; "verify-match" appeared in the child's chatter. Tell fp_stop to
+    ; SIGTERM + reap + close so we don't wait the device-release
+    ; window that fprintd-verify normally takes before exit. fp_stop
+    ; needs fp_active=1 to do anything; it is, so just call it.
+    call fp_stop
+    push rax
+    push rcx
+    push rdx
+    push rsi
+    push rdi
+    mov rax, SYS_WRITE
+    mov rdi, 2
+    lea rsi, [fp_msg_match]
+    mov rdx, fp_msg_match_len
+    syscall
+    pop rdi
+    pop rsi
+    pop rdx
+    pop rcx
+    pop rax
+    mov eax, 1
     ret
 
 ; ----------------------------------------------------------------------------
