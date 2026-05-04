@@ -2728,7 +2728,7 @@ fp_scan_match:
     dec rdx
     jmp .fsm_loop
 .fsm_no:
-    xor rax, rax
+    xor eax, eax
     ret
 
 ; ----------------------------------------------------------------------------
@@ -3076,7 +3076,6 @@ event_loop:
 keysym_for:
     push rbx
     sub eax, [min_keycode]
-    test eax, eax
     js .ks_zero
     cmp eax, [max_keycode]
     jg .ks_zero
