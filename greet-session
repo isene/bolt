@@ -28,10 +28,18 @@ fi
 # --- split as frame (and as gdm). Auth via a throwaway xauth cookie.
 VT="vt$(fgconsole 2>/dev/null || echo 1)"
 XAUTH=/run/bolt-greet.xauth
-rm -f "$XAUTH" /tmp/.X11-unix/X0
-touch "$XAUTH"; chown "$U:$U" "$XAUTH"
-runuser -u "$U" -- xauth -f "$XAUTH" add :0 MIT-MAGIC-COOKIE-1 "$(mcookie)" \
-    2>/dev/null
+rm -f "$XAUTH" "$XAUTH-c" "$XAUTH-l" /tmp/.X11-unix/X0
+# Generate the cookie AS ROOT: xauth creates lock files next to the target,
+# and geir cannot write /run — the runuser variant timed out silently and
+# left a 0-byte cookie file (every CHasm client then connected cookie-less
+# and tile's phantom auth bytes desynced the server). chown after, so the
+# session's clients can read it.
+xauth -q -f "$XAUTH" add :0 MIT-MAGIC-COOKIE-1 "$(mcookie)" 2>&1 | head -2 >&2
+chown "$U:$U" "$XAUTH"
+if [ ! -s "$XAUTH" ]; then
+    echo "greet-session: FATAL: cookie file empty after xauth add" >&2
+    exit 1
+fi
 
 # Run Xorg OUTSIDE any logind session (transient systemd unit — what real
 # display managers do). Inside a session, Xorg's logind integration takes
@@ -105,7 +113,6 @@ setsid runuser -u "$U" -- env \
     XDG_DATA_DIRS="/usr/local/share:/usr/share" \
     LANG=en_US.UTF-8 XDG_SESSION_TYPE=x11 \
     MOZ_DISABLE_CONTENT_SANDBOX=1 \
-    TILE_STRACE=1 \
     "${SESSION[@]}" &
 SPID=$!
 # TEMP DIAGNOSTIC: snapshot WS/tray/Mod4 ground truth 10s into the session
