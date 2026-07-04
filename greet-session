@@ -33,20 +33,21 @@ touch "$XAUTH"; chown "$U:$U" "$XAUTH"
 runuser -u "$U" -- xauth -f "$XAUTH" add :0 MIT-MAGIC-COOKIE-1 "$(mcookie)" \
     2>/dev/null
 
-# Keep logind OUT of this Xorg: it is root and takes DRM directly. Via
-# logind it gets handed a PAUSED drm fd whenever our VT/session isn't the
-# one logind considers active → "(EE) no screens found", dead session.
-XCFG=/run/bolt-greet-xorg.conf
-cat > "$XCFG" <<'EOF'
-Section "ServerFlags"
-    Option "systemd-logind" "false"
-EndSection
-EOF
+# Run Xorg OUTSIDE any logind session (transient systemd unit — what real
+# display managers do). Inside a session, Xorg's logind integration takes
+# over and logind hands it a PAUSED drm fd whenever it disagrees about the
+# active session ("no screens found"); its fallback then probes the wrong
+# card. With no session to take control of, Xorg opens DRM directly as
+# root and finds card1 via udev.
+XUNIT=bolt-greet-x
+systemctl reset-failed "$XUNIT" 2>/dev/null
+systemctl stop "$XUNIT" 2>/dev/null
 
 ts "starting Xorg on $VT"
-/usr/lib/xorg/Xorg :0 "$VT" -auth "$XAUTH" -config "$XCFG" -keeptty -noreset \
-    > /tmp/bolt-greet-xorg.log 2>&1 &
-XPID=$!
+systemd-run --unit="$XUNIT" --collect --quiet \
+    -p StandardOutput=append:/tmp/bolt-greet-xorg.log \
+    -p StandardError=append:/tmp/bolt-greet-xorg.log \
+    /usr/lib/xorg/Xorg :0 "$VT" -auth "$XAUTH" -noreset
 for _ in $(seq 1 50); do [ -e /tmp/.X11-unix/X0 ] && break; sleep 0.1; done
 # Socket existing is not "up" — probe with a real client before launching
 # the session (a "no screens found" Xorg dies right after binding).
@@ -54,12 +55,13 @@ XOK=0
 for _ in $(seq 1 30); do
     if runuser -u "$U" -- env DISPLAY=:0 XAUTHORITY="$XAUTH" xdpyinfo \
         >/dev/null 2>&1; then XOK=1; break; fi
-    kill -0 "$XPID" 2>/dev/null || break
+    systemctl is-active --quiet "$XUNIT" || break
     sleep 0.1
 done
 if [ "$XOK" != "1" ]; then
     echo "greet-session: Xorg failed:" >&2
     tail -5 /tmp/bolt-greet-xorg.log >&2
+    systemctl stop "$XUNIT" 2>/dev/null
     exit 1
 fi
 ts "Xorg up"
@@ -102,7 +104,6 @@ for _ in $(seq 1 20); do
     sleep 0.1
 done
 kill -KILL -- "-$SPID" 2>/dev/null
-kill "$XPID" 2>/dev/null
-wait "$XPID" 2>/dev/null
+systemctl stop "$XUNIT" 2>/dev/null
 ts "cleaned up"
 exit 0
