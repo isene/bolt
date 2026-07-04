@@ -36,6 +36,7 @@
 %define SYS_EXIT          60
 %define SYS_WAIT4         61
 %define SYS_RT_SIGACTION  13
+%define SYS_FLOCK         73
 %define SYS_RT_SIGRETURN  15
 %define SA_RESTORER       0x04000000
 %define SYS_TIME          201
@@ -147,6 +148,7 @@ arg_fbtest:     db "--fbtest", 0
 arg_tz:         db "--tz", 0
 arg_vt:         db "--vt", 0
 path_vt_active: db "/sys/class/tty/tty0/active", 0
+path_lock:      db "/run/bolt-greet.lock", 0
 
 log_start:      db "bolt-greet: starting", 10
 log_start_len   equ $ - log_start
@@ -183,6 +185,8 @@ log_vt_away:    db "bolt-greet: VT switched away, released display", 10
 log_vt_away_len equ $ - log_vt_away
 log_vt_back:    db "bolt-greet: VT back, re-took display", 10
 log_vt_back_len equ $ - log_vt_back
+log_dup:        db "bolt-greet: another instance is already running", 10
+log_dup_len     equ $ - log_dup
 str_x:          db "x", 0
 str_nl:         db 10, 0
 
@@ -320,6 +324,31 @@ _start:
     lea rsi, [log_start]
     mov rdx, log_start_len
     call write_stderr
+
+    ; Single instance: flock /run/bolt-greet.lock (auto-released on ANY
+    ; process death — no stale pidfiles). Two greeters steal DRM master
+    ; from each other and both eat evdev keys. Unwritable /run (fbtest as
+    ; a normal user) just skips the guard.
+    mov rax, SYS_OPEN
+    lea rdi, [path_lock]
+    mov esi, 0x42                       ; O_RDWR|O_CREAT
+    mov edx, 0o644
+    syscall
+    test rax, rax
+    js  .lock_done
+    mov edi, eax                        ; fd held for life (leaked on purpose)
+    mov rax, SYS_FLOCK
+    mov esi, 6                          ; LOCK_EX|LOCK_NB
+    syscall
+    test rax, rax
+    jns .lock_done
+    lea rsi, [log_dup]
+    mov rdx, log_dup_len
+    call write_stderr
+    mov rax, SYS_EXIT
+    mov edi, 1
+    syscall
+.lock_done:
 
     ; Ctrl+C / kill / hangup restore the console CRTC and exit — a wedged
     ; or invisible greeter must never need a hard reboot.

@@ -10,6 +10,12 @@
 # (signal handler tears down DRM). Worst case, switch VT and read the log.
 LOG=/tmp/bolt-greet.log
 
+# One greeter at a time (the binary also flocks /run/bolt-greet.lock).
+if pgrep -x bolt-greet >/dev/null 2>&1; then
+    echo "bolt-greet-run: a greeter is already running (pgrep -x bolt-greet)." >&2
+    exit 1
+fi
+
 # The kernel allows same-uid DRM master takeover, so a running Xorg/frame
 # does NOT protect itself against us — starting the greeter over a live
 # session steals the panel mid-use. Refuse unless the display is free.
