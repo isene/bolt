@@ -33,12 +33,35 @@ touch "$XAUTH"; chown "$U:$U" "$XAUTH"
 runuser -u "$U" -- xauth -f "$XAUTH" add :0 MIT-MAGIC-COOKIE-1 "$(mcookie)" \
     2>/dev/null
 
+# Keep logind OUT of this Xorg: it is root and takes DRM directly. Via
+# logind it gets handed a PAUSED drm fd whenever our VT/session isn't the
+# one logind considers active → "(EE) no screens found", dead session.
+XCFG=/run/bolt-greet-xorg.conf
+cat > "$XCFG" <<'EOF'
+Section "ServerFlags"
+    Option "systemd-logind" "false"
+EndSection
+EOF
+
 ts "starting Xorg on $VT"
-/usr/lib/xorg/Xorg :0 "$VT" -auth "$XAUTH" -keeptty -noreset \
+/usr/lib/xorg/Xorg :0 "$VT" -auth "$XAUTH" -config "$XCFG" -keeptty -noreset \
     > /tmp/bolt-greet-xorg.log 2>&1 &
 XPID=$!
 for _ in $(seq 1 50); do [ -e /tmp/.X11-unix/X0 ] && break; sleep 0.1; done
-kill -0 "$XPID" 2>/dev/null || { echo "greet-session: Xorg died" >&2; exit 1; }
+# Socket existing is not "up" — probe with a real client before launching
+# the session (a "no screens found" Xorg dies right after binding).
+XOK=0
+for _ in $(seq 1 30); do
+    if runuser -u "$U" -- env DISPLAY=:0 XAUTHORITY="$XAUTH" xdpyinfo \
+        >/dev/null 2>&1; then XOK=1; break; fi
+    kill -0 "$XPID" 2>/dev/null || break
+    sleep 0.1
+done
+if [ "$XOK" != "1" ]; then
+    echo "greet-session: Xorg failed:" >&2
+    tail -5 /tmp/bolt-greet-xorg.log >&2
+    exit 1
+fi
 ts "Xorg up"
 
 if [ "$CH" = "3" ]; then
