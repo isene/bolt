@@ -145,7 +145,10 @@ gs_choice3:     db "3", 0
 env_path:       db "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 0
 env_home:       db "HOME=/root", 0
 env_term:       db "TERM=linux", 0
-child_envp:     dq env_path, env_home, env_term, 0
+env_mark:       db "GREET_SESSION=1", 0    ; stray-sweep marker: everything a
+                                           ; session spawns inherits it; the
+                                           ; wrapper kills carriers at startup
+child_envp:     dq env_path, env_home, env_term, env_mark, 0
 
 arg_fbtest:     db "--fbtest", 0
 arg_tz:         db "--tz", 0

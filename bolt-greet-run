@@ -25,6 +25,27 @@ if [ -n "$(ls /tmp/.X11-unix/ 2>/dev/null)" ] && [ "${GREET_FORCE:-0}" != "1" ];
     exit 1
 fi
 
+# Stray sweep: everything a greeter tree ever spawns carries GREET_SESSION=1
+# (the wrapper exports it below; bolt-greet passes it to sessions). With no
+# display server running (guard above), any process still carrying it is a
+# leftover from a previous run — kill by exact PID, never by name. Two
+# passes: TERM, then KILL for anything ignoring it.
+sweep(){
+    local sig=$1 found=0
+    for d in /proc/[0-9]*/environ; do
+        local p=${d%/environ}; p=${p#/proc/}
+        [ "$p" = "$$" ] && continue
+        if grep -qzs 'GREET_SESSION=1' "$d" 2>/dev/null; then
+            found=1
+            [ "$sig" = "-TERM" ] && echo "bolt-greet-run: killing stray $p ($(tr '\0' ' ' < /proc/$p/cmdline 2>/dev/null | head -c 50))" >&2
+            kill "$sig" "$p" 2>/dev/null
+        fi
+    done
+    return $((1 - found))
+}
+if sweep -TERM; then sleep 0.5; sweep -KILL; sleep 0.2; fi
+export GREET_SESSION=1
+
 : > "$LOG"
 # Own VT number: evdev input is global, so bolt-greet gates keys on the
 # active VT and hands the display back when you switch away (Alt+F-keys).
