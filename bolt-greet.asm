@@ -64,7 +64,8 @@
 %define DRM_IOCTL_MODE_CREATE_DUMB     0xC02064B2
 %define DRM_IOCTL_MODE_MAP_DUMB        0xC01064B3
 %define DRM_IOCTL_MODE_DESTROY_DUMB    0xC00464B4
-%define DRM_IOCTL_MODE_DIRTYFB         0xC01864B7
+%define DRM_IOCTL_MODE_PAGE_FLIP       0xC01864B0
+%define DRM_MODE_PAGE_FLIP_EVENT       0x01
 
 %define DRM_MODE_CONNECTED   1
 %define DRM_MODE_INFO_SIZE   68
@@ -91,23 +92,24 @@
 %define KEY_DOWN    108
 
 ; ---- layout / colours (memory dwords are X,R,G,B little-endian = B,G,R,X) --
-%define PANEL_W     760
-%define PANEL_H     520
+; Strip-like top info bar + session selector across the bottom; the
+; wallpaper stays unobstructed in between.
+%define TOPBAR_H    40
+%define BOTBAR_H    64
 %define COL_ACCENT  0x00E8890F      ; warm orange
 %define COL_TEXT    0x00EAEAEA
 %define COL_DIM     0x00909090
 %define COL_SELTEXT 0x00101010      ; text on the accent bar
-%define COL_BG      0x00101418      ; fallback bg if no wallpaper
+%define COL_BG      0x00101418      ; bar fill + fallback bg if no wallpaper
 
 section .rodata
 %include "greetfont.inc"            ; greet_font: 95 glyphs, ASCII 32..126, 8x16
 
 str_title:      db "CHasm", 0
-str_subtitle:   db "choose a session", 0
-str_row0:       db "1   tile on frame", 0
-str_row1:       db "2   tile on X", 0
-str_row2:       db "3   i3 on X", 0
-str_buttons:    db "[s] suspend      [p] power off", 0
+str_row0:       db "1  tile on frame", 0
+str_row1:       db "2  tile on X", 0
+str_row2:       db "3  i3 on X", 0
+str_hints:      db "[s] suspend   [p] power off   [Esc] console", 0
 str_sep:        db "   ", 0
 str_bat:        db "BAT ", 0
 str_pctsp:      db "% ", 0
@@ -189,11 +191,22 @@ fbtest_mode:    resb 1
 sel:            resd 1                  ; selected row 0..2
 tz_offset_min:  resd 1                  ; local-time offset, minutes east of UTC
 
-fb_addr:        resq 1
+fb_addr:        resq 1                  ; render target = db_addr[back_idx]
 fb_w:           resd 1
 fb_h:           resd 1
 fb_pitch:       resd 1
 fb_size:        resq 1
+
+; Double-buffered presentation: render into the back buffer, PAGE_FLIP it in.
+; eDP PSR freezes scanout on idle frames — flips are the reliable wake-up
+; (DIRTYFB was not enough on this panel); frame's compositor works the same
+; way. First present is a SETCRTC (binds mode + fb in one go).
+db_addr:        resq 2
+db_handle:      resd 2
+db_fbid:        resd 2
+back_idx:       resd 1
+crtc_bound:     resb 1                  ; 0 until the first SETCRTC
+cur_front_fbid: resd 1                  ; what the CRTC scans now (suspend reassert)
 
 ; DRM state (struct layouts mirror frame.asm)
 drm_fd:         resq 1
@@ -218,11 +231,8 @@ drm_dumb_destroy: resb 8
 drm_set_conn_id: resd 1
 drm_chosen_conn: resd 1
 drm_chosen_crtc: resd 1
-drm_fb_id:      resd 1
-drm_dumb_handle: resd 1
 drm_dumb_pitch: resd 1
 drm_dumb_size:  resq 1
-drm_dumb_offset: resq 1
 
 WALL_MAX        equ 1920*1200*4
 wallpaper_ok:   resb 1
@@ -252,7 +262,8 @@ wait_status:    resd 1
 sig_sa_buf:     resb 32
 lognum_buf:     resb 16
     alignb 8
-dirty_cmd:      resb 24                 ; struct drm_mode_fb_dirty_cmd
+flip_cmd:       resb 24                 ; struct drm_mode_crtc_page_flip
+drm_pollfd:     resb 8                  ; wait_flip's single pollfd
 
 section .text
 global _start
@@ -364,18 +375,16 @@ greeter_loop:
     call update_clock
     call update_battery
     call render_frame
-    call flush_fb                       ; caches → RAM + DIRTYFB rescan
+    call flush_fb                       ; caches → RAM before the flip
+    call present_frame                  ; first: SETCRTC; later: PAGE_FLIP
+    test rax, rax
+    js  .gl_exit                        ; first bind failed
     test ebx, ebx
     jnz .gl_poll
-    ; First frame: the buffer now holds the finished menu — point the CRTC
-    ; at it (drm_init deliberately skips SETCRTC so black is never shown).
-    call drm_reassert
-    test rax, rax
-    js  .gl_exit
+    inc ebx
     lea rsi, [log_setcrtc]
     mov rdx, log_setcrtc_len
     call write_stderr
-    inc ebx
     lea rsi, [log_menu_up]
     mov rdx, log_menu_up_len
     call write_stderr
@@ -738,7 +747,8 @@ handle_key:
     ret
 
 ; ============================================================================
-; render_frame — wallpaper/bg + centered panel + text + footer.
+; render_frame — wallpaper + strip-like top info bar + bottom session
+; selector. The wallpaper stays unobstructed in between.
 ; ============================================================================
 render_frame:
     push rbx
@@ -747,113 +757,120 @@ render_frame:
     push r14
     push r15
     call draw_background
-    ; panel x/y
-    mov r12d, [fb_w]
-    sub r12d, PANEL_W
-    shr r12d, 1
-    mov r13d, [fb_h]
-    sub r13d, PANEL_H
-    shr r13d, 1
-    ; darken panel area (shift each pixel right 2 = 25% brightness)
-    mov edi, r12d
-    mov esi, r13d
-    mov edx, PANEL_W
-    mov ecx, PANEL_H
-    call darken_rect
-    ; accent top bar 4px
-    mov edi, r12d
-    mov esi, r13d
-    mov edx, PANEL_W
-    mov ecx, 4
-    mov r8d, COL_ACCENT
-    call fill_rect
 
-    ; title, scale 4, centered, y+30
-    mov edi, r12d
-    add edi, PANEL_W/2
-    mov esi, r13d
-    add esi, 30
+    ; ---- top bar: full width, TOPBAR_H, dark ----
+    xor edi, edi
+    xor esi, esi
+    mov edx, [fb_w]
+    mov ecx, TOPBAR_H
+    mov r8d, COL_BG
+    call fill_rect
+    ; "CHasm" accent, left
+    mov edi, 16
+    mov esi, 4
     lea rdx, [str_title]
-    mov ecx, 4
+    mov ecx, 2
     mov r8d, COL_ACCENT
-    call draw_cstr_centered
-    ; subtitle, scale 2, dim, y+110
-    mov edi, r12d
-    add edi, PANEL_W/2
-    mov esi, r13d
-    add esi, 110
-    lea rdx, [str_subtitle]
+    call draw_cstr
+    ; key hints, dim, after the title
+    mov edi, 200
+    mov esi, 4
+    lea rdx, [str_hints]
     mov ecx, 2
     mov r8d, COL_DIM
-    call draw_cstr_centered
+    call draw_cstr
+    ; date/clock/battery, right-aligned
+    call build_footer
+    lea rdi, [footer_buf]
+    call cstr_len
+    shl eax, 4                          ; * 8px * scale 2
+    mov edi, [fb_w]
+    sub edi, 16
+    sub edi, eax
+    mov esi, 4
+    lea rdx, [footer_buf]
+    mov ecx, 2
+    mov r8d, COL_TEXT
+    call draw_cstr
 
-    ; rows, scale 3: y = panel_y + 170 + i*72
+    ; ---- bottom bar: full width, BOTBAR_H, dark ----
+    xor edi, edi
+    mov esi, [fb_h]
+    sub esi, BOTBAR_H
+    mov edx, [fb_w]
+    mov ecx, BOTBAR_H
+    mov r8d, COL_BG
+    call fill_rect
+    ; three sessions centered at W/6, W/2, 5W/6
     xor r14d, r14d
 .rf_row:
     cmp r14d, 3
     jge .rf_rows_done
-    mov r15d, r14d
-    imul r15d, 72
-    add r15d, r13d
-    add r15d, 170
+    mov eax, r14d
+    shl eax, 1
+    inc eax                             ; 2i+1
+    imul eax, [fb_w]
+    xor edx, edx
+    mov ecx, 6
+    div ecx
+    mov r15d, eax                       ; centre x
+    lea r13, [str_row0]
+    cmp r14d, 1
+    jne .rf_l2q
+    lea r13, [str_row1]
+.rf_l2q:
+    cmp r14d, 2
+    jne .rf_lbl_ok
+    lea r13, [str_row2]
+.rf_lbl_ok:
     cmp r14d, [sel]
     jne .rf_no_hl
-    ; highlight bar behind selected row
-    mov edi, r12d
-    add edi, 26
-    mov esi, r15d
-    sub esi, 8
-    mov edx, PANEL_W - 52
-    mov ecx, 62
+    ; accent box behind the selected entry
+    mov rdi, r13
+    call cstr_len
+    shl eax, 4                          ; text width
+    add eax, 32                         ; + padding
+    mov ecx, eax
+    shr ecx, 1
+    mov edi, r15d
+    sub edi, ecx
+    mov esi, [fb_h]
+    sub esi, BOTBAR_H - 8
+    mov edx, eax
+    mov ecx, 48
     mov r8d, COL_ACCENT
     call fill_rect
 .rf_no_hl:
-    mov edi, r12d
-    add edi, 60
-    mov esi, r15d
-    lea rdx, [str_row0]
-    cmp r14d, 1
-    jne .rf_l2q
-    lea rdx, [str_row1]
-.rf_l2q:
-    cmp r14d, 2
-    jne .rf_draw
-    lea rdx, [str_row2]
-.rf_draw:
-    mov ecx, 3
+    mov edi, r15d
+    mov esi, [fb_h]
+    sub esi, BOTBAR_H - 16
+    mov rdx, r13
+    mov ecx, 2
     mov r8d, COL_TEXT
     cmp r14d, [sel]
     jne .rf_col_ok
     mov r8d, COL_SELTEXT
 .rf_col_ok:
-    call draw_cstr
+    call draw_cstr_centered
     inc r14d
     jmp .rf_row
 .rf_rows_done:
-    ; buttons line, scale 2, dim, y+420
-    mov edi, r12d
-    add edi, PANEL_W/2
-    mov esi, r13d
-    add esi, 420
-    lea rdx, [str_buttons]
-    mov ecx, 2
-    mov r8d, COL_DIM
-    call draw_cstr_centered
-    ; footer, scale 2, y+470
-    call build_footer
-    mov edi, r12d
-    add edi, PANEL_W/2
-    mov esi, r13d
-    add esi, 470
-    lea rdx, [footer_buf]
-    mov ecx, 2
-    mov r8d, COL_TEXT
-    call draw_cstr_centered
     pop r15
     pop r14
     pop r13
     pop r12
     pop rbx
+    ret
+
+; cstr_len — rdi = NUL-terminated string → eax = length. Preserves rdi.
+cstr_len:
+    xor eax, eax
+.cl_loop:
+    cmp byte [rdi + rax], 0
+    je  .cl_done
+    inc eax
+    jmp .cl_loop
+.cl_done:
     ret
 
 ; ============================================================================
@@ -956,45 +973,6 @@ fill_rect:
     dec r12d
     jnz .fr_rows
 .fr_done:
-    pop r13
-    pop r12
-    pop rbx
-    ret
-
-; ============================================================================
-; darken_rect — edi=x esi=y edx=w ecx=h. Darkens pixels to 25% ((p>>2)&mask).
-; Assumes the rect is within bounds (panel is always inside). Preserves r12+.
-; ============================================================================
-darken_rect:
-    push rbx
-    push r12
-    push r13
-    push r14
-    mov r12d, ecx                       ; rows
-    mov r13d, edx                       ; width px
-    mov eax, esi
-    imul eax, [fb_pitch]
-    mov rbx, [fb_addr]
-    add rbx, rax
-    mov eax, edi
-    shl eax, 2
-    add rbx, rax
-.dk_rows:
-    mov rdi, rbx
-    mov ecx, r13d
-.dk_px:
-    mov eax, [rdi]
-    shr eax, 2
-    and eax, 0x003F3F3F                 ; keep 6 bits per channel post-shift
-    mov [rdi], eax
-    add rdi, 4
-    dec ecx
-    jnz .dk_px
-    mov eax, [fb_pitch]
-    add rbx, rax
-    dec r12d
-    jnz .dk_rows
-    pop r14
     pop r13
     pop r12
     pop rbx
@@ -1611,86 +1589,23 @@ drm_init:
     call write_u32_stderr
     lea rsi, [str_nl]
     call write_cstr_stderr
-    ; CREATE_DUMB
-    lea rdi, [drm_dumb_create]
-    xor eax, eax
-    mov ecx, 4
-    rep stosq
-    mov eax, [fb_w]
-    mov [drm_dumb_create + 4], eax      ; width
-    mov eax, [fb_h]
-    mov [drm_dumb_create + 0], eax      ; height
-    mov dword [drm_dumb_create + 8], 32
-    mov rax, SYS_IOCTL
-    mov rdi, [drm_fd]
-    mov esi, DRM_IOCTL_MODE_CREATE_DUMB
-    lea rdx, [drm_dumb_create]
-    syscall
+    ; Two dumb buffers + fbs (double-buffered flips). No SETCRTC here —
+    ; greeter_loop renders the first frame FIRST, then present_frame binds
+    ; the CRTC to it, so the panel never shows a black buffer.
+    xor ebx, ebx
+.di_buf_loop:
+    cmp ebx, 2
+    jge .di_bufs_done
+    call drm_create_buffer              ; ebx = index
     test rax, rax
     js  .di_close_fail
-    mov eax, [drm_dumb_create + 16]
-    mov [drm_dumb_handle], eax
-    mov eax, [drm_dumb_create + 20]
-    mov [drm_dumb_pitch], eax
-    mov [fb_pitch], eax
-    mov rax, [drm_dumb_create + 24]
-    mov [drm_dumb_size], rax
-    mov [fb_size], rax
-    ; MAP_DUMB
-    lea rdi, [drm_dumb_map]
-    xor eax, eax
-    mov ecx, 2
-    rep stosq
-    mov eax, [drm_dumb_handle]
-    mov [drm_dumb_map], eax
-    mov rax, SYS_IOCTL
-    mov rdi, [drm_fd]
-    mov esi, DRM_IOCTL_MODE_MAP_DUMB
-    lea rdx, [drm_dumb_map]
-    syscall
-    test rax, rax
-    js  .di_close_fail
-    mov rax, [drm_dumb_map + 8]
-    mov [drm_dumb_offset], rax
-    ; mmap
-    mov rax, SYS_MMAP
-    xor edi, edi
-    mov rsi, [drm_dumb_size]
-    mov edx, PROT_RW
-    mov r10d, MAP_SHARED
-    mov r8, [drm_fd]
-    mov r9, [drm_dumb_offset]
-    syscall
-    cmp rax, -4096
-    ja  .di_close_fail
+    inc ebx
+    jmp .di_buf_loop
+.di_bufs_done:
+    mov dword [back_idx], 0
+    mov byte [crtc_bound], 0
+    mov rax, [db_addr]
     mov [fb_addr], rax
-    ; ADDFB
-    lea rdi, [drm_fb_cmd]
-    xor eax, eax
-    mov ecx, 7
-    rep stosd
-    mov eax, [fb_w]
-    mov [drm_fb_cmd + 4], eax
-    mov eax, [fb_h]
-    mov [drm_fb_cmd + 8], eax
-    mov eax, [drm_dumb_pitch]
-    mov [drm_fb_cmd + 12], eax
-    mov dword [drm_fb_cmd + 16], 32
-    mov dword [drm_fb_cmd + 20], 24
-    mov eax, [drm_dumb_handle]
-    mov [drm_fb_cmd + 24], eax
-    mov rax, SYS_IOCTL
-    mov rdi, [drm_fd]
-    mov esi, DRM_IOCTL_MODE_ADDFB
-    lea rdx, [drm_fb_cmd]
-    syscall
-    test rax, rax
-    js  .di_close_fail
-    mov eax, [drm_fb_cmd]
-    mov [drm_fb_id], eax
-    ; NOTE: no SETCRTC here — greeter_loop renders the first frame into the
-    ; buffer FIRST, then drm_reassert points the CRTC at it. The panel never
-    ; shows the zeroed (black) buffer, and PSR can't freeze on an empty frame.
     xor eax, eax
     jmp .di_out
 .di_master_fail:
@@ -1714,12 +1629,9 @@ drm_init:
     pop rbx
     ret
 
-; flush_fb — clflush the whole framebuffer so the writes reach RAM, then
-; DIRTYFB so the display engine actually rescans it. eDP Panel Self
-; Refresh freezes scanout on an idle screen — CPU writes to a dumb buffer
-; never show without a dirty notification (frame sidesteps this by
-; page-flipping every composite; fbcon issues dirtyfb like we do here).
-; ~9 MB per redraw; redraws happen per keypress / 30 s tick.
+; flush_fb — clflush the back buffer so the render reaches RAM before the
+; flip (scanout is not CPU-cache coherent). ~9 MB per redraw; redraws
+; happen per keypress / 30 s tick.
 flush_fb:
     mov rdi, [fb_addr]
     mov rcx, [fb_size]
@@ -1729,19 +1641,6 @@ flush_fb:
     sub rcx, 64
     ja  .ff_loop
     sfence
-    ; DIRTYFB: fb_id, flags=0, color=0, num_clips=0 (= whole fb), clips=0.
-    ; Ignore the result — drivers without dirty support return ENOSYS.
-    lea rdi, [dirty_cmd]
-    xor eax, eax
-    mov ecx, 3
-    rep stosq
-    mov eax, [drm_fb_id]
-    mov [dirty_cmd], eax
-    mov rax, SYS_IOCTL
-    mov rdi, [drm_fd]
-    mov esi, DRM_IOCTL_MODE_DIRTYFB
-    lea rdx, [dirty_cmd]
-    syscall
     ret
 
 ; install_exit_handler — edi = signal number. Kernel sigaction ABI needs
@@ -1781,7 +1680,160 @@ exit_handler:
     xor edi, edi
     syscall
 
-; drm_reassert — SETCRTC our fb (used at init and after suspend/resume).
+; drm_create_buffer — ebx = buffer index (0/1). CREATE_DUMB + MAP_DUMB +
+; mmap + ADDFB into db_handle/db_addr/db_fbid[ebx]. rax = 0 ok / -1 fail.
+drm_create_buffer:
+    lea rdi, [drm_dumb_create]
+    xor eax, eax
+    mov ecx, 4
+    rep stosq
+    mov eax, [fb_w]
+    mov [drm_dumb_create + 4], eax      ; width
+    mov eax, [fb_h]
+    mov [drm_dumb_create + 0], eax      ; height
+    mov dword [drm_dumb_create + 8], 32
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_CREATE_DUMB
+    lea rdx, [drm_dumb_create]
+    syscall
+    test rax, rax
+    js  .cb_fail
+    mov eax, [drm_dumb_create + 16]
+    mov [db_handle + rbx*4], eax
+    mov eax, [drm_dumb_create + 20]
+    mov [fb_pitch], eax
+    mov rax, [drm_dumb_create + 24]
+    mov [fb_size], rax
+    mov [drm_dumb_size], rax
+    ; MAP_DUMB
+    lea rdi, [drm_dumb_map]
+    xor eax, eax
+    mov ecx, 2
+    rep stosq
+    mov eax, [db_handle + rbx*4]
+    mov [drm_dumb_map], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_MAP_DUMB
+    lea rdx, [drm_dumb_map]
+    syscall
+    test rax, rax
+    js  .cb_fail
+    ; mmap
+    mov rax, SYS_MMAP
+    xor edi, edi
+    mov rsi, [drm_dumb_size]
+    mov edx, PROT_RW
+    mov r10d, MAP_SHARED
+    mov r8, [drm_fd]
+    mov r9, [drm_dumb_map + 8]
+    syscall
+    cmp rax, -4096
+    ja  .cb_fail
+    mov [db_addr + rbx*8], rax
+    ; ADDFB
+    lea rdi, [drm_fb_cmd]
+    xor eax, eax
+    mov ecx, 7
+    rep stosd
+    mov eax, [fb_w]
+    mov [drm_fb_cmd + 4], eax
+    mov eax, [fb_h]
+    mov [drm_fb_cmd + 8], eax
+    mov eax, [fb_pitch]
+    mov [drm_fb_cmd + 12], eax
+    mov dword [drm_fb_cmd + 16], 32
+    mov dword [drm_fb_cmd + 20], 24
+    mov eax, [db_handle + rbx*4]
+    mov [drm_fb_cmd + 24], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_ADDFB
+    lea rdx, [drm_fb_cmd]
+    syscall
+    test rax, rax
+    js  .cb_fail
+    mov eax, [drm_fb_cmd]
+    mov [db_fbid + rbx*4], eax
+    xor eax, eax
+    ret
+.cb_fail:
+    mov rax, -1
+    ret
+
+; present_frame — put the just-rendered back buffer on screen. First call
+; binds via SETCRTC (mode + fb); later calls PAGE_FLIP + wait for the flip
+; event (flips are what wake eDP PSR reliably). Swaps back_idx on success.
+; rax = 0 ok / -1 the first SETCRTC failed.
+present_frame:
+    push rbx
+    push r12
+    mov r12d, [back_idx]
+    mov eax, [db_fbid + r12*4]
+    mov [cur_front_fbid], eax
+    cmp byte [crtc_bound], 0
+    jne .pf_flip
+    call drm_reassert                   ; SETCRTC cur_front_fbid
+    test rax, rax
+    js  .pf_out                         ; leave crtc_bound 0; caller bails
+    mov byte [crtc_bound], 1
+    jmp .pf_swap
+.pf_flip:
+    lea rdi, [flip_cmd]
+    xor eax, eax
+    mov ecx, 3
+    rep stosq
+    mov eax, [drm_chosen_crtc]
+    mov [flip_cmd + 0], eax
+    mov eax, [cur_front_fbid]
+    mov [flip_cmd + 4], eax
+    mov dword [flip_cmd + 8], DRM_MODE_PAGE_FLIP_EVENT
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_PAGE_FLIP
+    lea rdx, [flip_cmd]
+    syscall
+    test rax, rax
+    js  .pf_setcrtc_fb                  ; flip refused → SETCRTC fallback
+    call wait_flip
+    jmp .pf_swap
+.pf_setcrtc_fb:
+    call drm_reassert
+.pf_swap:
+    xor dword [back_idx], 1
+    mov eax, [back_idx]
+    mov rax, [db_addr + rax*8]
+    mov [fb_addr], rax
+    xor eax, eax
+.pf_out:
+    pop r12
+    pop rbx
+    ret
+
+; wait_flip — poll the drm fd (≤500 ms) for the flip-complete event, drain it.
+wait_flip:
+    mov eax, [drm_fd]
+    mov [drm_pollfd], eax
+    mov word [drm_pollfd + 4], 1        ; POLLIN
+    mov word [drm_pollfd + 6], 0
+    mov rax, SYS_POLL
+    lea rdi, [drm_pollfd]
+    mov esi, 1
+    mov edx, 500
+    syscall
+    test rax, rax
+    jle .wf_out                         ; timeout/err — carry on regardless
+    mov rax, SYS_READ
+    mov rdi, [drm_fd]
+    lea rsi, [ev_buf]
+    mov edx, 24*32
+    syscall
+.wf_out:
+    ret
+
+; drm_reassert — SETCRTC cur_front_fbid (first bind, suspend/resume, flip
+; fallback).
 drm_reassert:
     mov eax, [drm_chosen_conn]
     mov [drm_set_conn_id], eax
@@ -1794,7 +1846,7 @@ drm_reassert:
     mov dword [drm_crtc_set + 8], 1
     mov eax, [drm_chosen_crtc]
     mov [drm_crtc_set + 12], eax
-    mov eax, [drm_fb_id]
+    mov eax, [cur_front_fbid]
     mov [drm_crtc_set + 16], eax
     mov dword [drm_crtc_set + 32], 1    ; mode_valid
     lea rsi, [drm_modes_buf]
@@ -1808,16 +1860,22 @@ drm_reassert:
     syscall
     ret
 
-; drm_teardown — restore CRTC, RMFB, munmap, DESTROY_DUMB, DROP_MASTER, close.
+; drm_teardown — restore CRTC, then RMFB + munmap + DESTROY both buffers,
+; DROP_MASTER, close.
 drm_teardown:
+    push rbx
     ; restore original CRTC
     mov rax, SYS_IOCTL
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_SETCRTC
     lea rdx, [drm_crtc_save]
     syscall
+    xor ebx, ebx
+.td_loop:
+    cmp ebx, 2
+    jge .td_done
     ; RMFB
-    mov eax, [drm_fb_id]
+    mov eax, [db_fbid + rbx*4]
     mov [drm_dumb_destroy], eax
     mov rax, SYS_IOCTL
     mov rdi, [drm_fd]
@@ -1826,17 +1884,20 @@ drm_teardown:
     syscall
     ; munmap
     mov rax, SYS_MUNMAP
-    mov rdi, [fb_addr]
+    mov rdi, [db_addr + rbx*8]
     mov rsi, [drm_dumb_size]
     syscall
     ; DESTROY_DUMB
-    mov eax, [drm_dumb_handle]
+    mov eax, [db_handle + rbx*4]
     mov [drm_dumb_destroy], eax
     mov rax, SYS_IOCTL
     mov rdi, [drm_fd]
     mov esi, DRM_IOCTL_MODE_DESTROY_DUMB
     lea rdx, [drm_dumb_destroy]
     syscall
+    inc ebx
+    jmp .td_loop
+.td_done:
     ; DROP_MASTER + close
     mov rax, SYS_IOCTL
     mov rdi, [drm_fd]
@@ -1846,6 +1907,7 @@ drm_teardown:
     mov rax, SYS_CLOSE
     mov rdi, [drm_fd]
     syscall
+    pop rbx
     ret
 
 ; drm_try_open — /dev/dri/card0..9, first that opens. rax = fd or -1.
