@@ -26,6 +26,7 @@
 %define SYS_OPEN          2
 %define SYS_CLOSE         3
 %define SYS_POLL          7
+%define SYS_LSEEK         8
 %define SYS_MMAP          9
 %define SYS_MUNMAP        11
 %define SYS_IOCTL         16
@@ -144,6 +145,8 @@ child_envp:     dq env_path, env_home, env_term, 0
 
 arg_fbtest:     db "--fbtest", 0
 arg_tz:         db "--tz", 0
+arg_vt:         db "--vt", 0
+path_vt_active: db "/sys/class/tty/tty0/active", 0
 
 log_start:      db "bolt-greet: starting", 10
 log_start_len   equ $ - log_start
@@ -176,6 +179,10 @@ log_devdrop:    db "bolt-greet: dropped dead input fd", 10
 log_devdrop_len equ $ - log_devdrop
 log_reassert:   db "bolt-greet: reassert CRTC after suspend", 10
 log_reassert_len equ $ - log_reassert
+log_vt_away:    db "bolt-greet: VT switched away, released display", 10
+log_vt_away_len equ $ - log_vt_away
+log_vt_back:    db "bolt-greet: VT back, re-took display", 10
+log_vt_back_len equ $ - log_vt_back
 str_x:          db "x", 0
 str_nl:         db 10, 0
 
@@ -254,6 +261,10 @@ gs_argv:        resq 3
 wait_status:    resd 1
 sig_sa_buf:     resb 32
 lognum_buf:     resb 16
+own_vt:         resd 1                  ; --vt N; 0 = VT gating disabled
+vt_fd:          resd 1                  ; /sys/class/tty/tty0/active (or -1)
+vt_active:      resb 1                  ; 1 = our VT is foreground
+vtbuf:          resb 16
     alignb 8
 flip_cmd:       resb 24                 ; struct drm_mode_crtc_page_flip
 drm_pollfd:     resb 8                  ; wait_flip's single pollfd
@@ -282,13 +293,25 @@ _start:
     mov rdi, [rsp + 8 + r12*8]          ; streq_cstr advanced rdi; reload
     lea rsi, [arg_tz]
     call streq_cstr
-    jne .arg_next
+    jne .arg_vtq
     ; next argv = "+HHMM" / "-HHMM" (date +%z format)
     inc r12
     cmp r12, rbx
     jge .arg_done
     mov rdi, [rsp + 8 + r12*8]
     call parse_tz
+    jmp .arg_next
+.arg_vtq:
+    mov rdi, [rsp + 8 + r12*8]
+    lea rsi, [arg_vt]
+    call streq_cstr
+    jne .arg_next
+    inc r12
+    cmp r12, rbx
+    jge .arg_done
+    mov rdi, [rsp + 8 + r12*8]
+    call atoi_buf
+    mov [own_vt], eax
 .arg_next:
     inc r12
     jmp .arg_loop
@@ -362,8 +385,11 @@ _start:
 greeter_loop:
     push rbx
     call init_input
+    call vt_watch_init                  ; /sys active-VT watch (POLLPRI)
     xor ebx, ebx                        ; first-frame flag (log "menu up" once)
 .gl_iter:
+    cmp byte [vt_active], 1
+    jne .gl_poll                        ; VT away: no render, no present
     call update_clock
     call update_battery
     call render_frame
@@ -381,15 +407,16 @@ greeter_loop:
     mov rdx, log_menu_up_len
     call write_stderr
 .gl_poll:
-    call build_pollfds
+    call build_pollfds                  ; eax = nfds (inputs + VT watch)
+    mov esi, eax
     mov rax, SYS_POLL
     lea rdi, [pollfds]
-    mov esi, [input_fd_count]
     mov edx, 30000                      ; 30s tick for the clock
     syscall
     test rax, rax
     jz  .gl_iter                        ; timeout → refresh clock/battery
     js  .gl_poll                        ; EINTR
+    call vt_check                       ; VT switch? release/re-take display
     call drain_input                    ; eax: 0 none, 1-3 launch, 10 susp,
     test eax, eax                       ;      11 off, 20 esc
     jz  .gl_iter
@@ -583,14 +610,24 @@ build_pollfds:
     xor ebx, ebx
 .bp_loop:
     cmp ebx, [input_fd_count]
-    jge .bp_done
+    jge .bp_vt
     mov eax, [input_fds + rbx*4]
     mov [pollfds + rbx*8], eax          ; fd
     mov word [pollfds + rbx*8 + 4], 1   ; events = POLLIN
     mov word [pollfds + rbx*8 + 6], 0   ; revents
     inc ebx
     jmp .bp_loop
+.bp_vt:
+    ; active-VT watch as the extra last slot (sysfs_notify → POLLPRI)
+    cmp dword [vt_fd], 0
+    jl  .bp_done
+    mov eax, [vt_fd]
+    mov [pollfds + rbx*8], eax
+    mov word [pollfds + rbx*8 + 4], 2   ; POLLPRI
+    mov word [pollfds + rbx*8 + 6], 0
+    inc ebx
 .bp_done:
+    mov eax, ebx                        ; nfds for the caller
     pop rbx
     ret
 
@@ -635,6 +672,8 @@ drain_input:
     cmp ecx, 1
     jne .di_ev_next
     movzx edx, word [ev_buf + r13 + 18] ; keycode
+    cmp byte [vt_active], 1             ; keys only count on OUR VT — evdev
+    jne .di_ev_next                     ; is global, the console focus is not
     call handle_key
     test eax, eax
     jz  .di_ev_next
@@ -1582,6 +1621,93 @@ flush_fb:
     sub rcx, 64
     ja  .ff_loop
     sfence
+    ret
+
+; vt_watch_init — open /sys/class/tty/tty0/active (pollable: POLLPRI on VT
+; switch) and prime vt_active. own_vt 0 (no --vt) disables gating entirely.
+vt_watch_init:
+    mov dword [vt_fd], -1
+    mov byte [vt_active], 1
+    cmp dword [own_vt], 0
+    je  .vw_out                         ; gating disabled
+    mov rax, SYS_OPEN
+    lea rdi, [path_vt_active]
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    js  .vw_out                         ; no sysfs? gating disabled
+    mov [vt_fd], eax
+    call vt_read_active
+    cmp eax, [own_vt]
+    sete al
+    mov [vt_active], al
+.vw_out:
+    ret
+
+; vt_read_active — pread the watch file, parse "ttyN" → eax = N (0 on error).
+vt_read_active:
+    mov rax, SYS_LSEEK
+    mov edi, [vt_fd]
+    xor esi, esi
+    xor edx, edx
+    syscall
+    mov rax, SYS_READ
+    mov edi, [vt_fd]
+    lea rsi, [vtbuf]
+    mov edx, 15
+    syscall
+    test rax, rax
+    jle .vr_err
+    mov byte [vtbuf + rax], 0
+    lea rdi, [vtbuf + 3]                ; skip "tty"
+    call atoi_buf
+    ret
+.vr_err:
+    xor eax, eax
+    ret
+
+; vt_check — called on every poll wake. On VT-away: give the console back
+; (restore saved CRTC, drop master) so the user is not typing blind into an
+; invisible shell. On VT-return: re-take master; the next .gl_iter render
+; re-binds via SETCRTC (crtc_bound=0).
+vt_check:
+    cmp dword [vt_fd], 0
+    jl  .vc_out
+    call vt_read_active
+    cmp eax, [own_vt]
+    sete al
+    cmp al, [vt_active]
+    je  .vc_out
+    mov [vt_active], al
+    test al, al
+    jz  .vc_away
+    ; back: re-take the device
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_SET_MASTER
+    xor edx, edx
+    syscall
+    mov byte [crtc_bound], 0            ; next present = SETCRTC
+    lea rsi, [log_vt_back]
+    mov rdx, log_vt_back_len
+    call write_stderr
+    ret
+.vc_away:
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_SETCRTC
+    lea rdx, [drm_crtc_save]
+    syscall
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_DROP_MASTER
+    xor edx, edx
+    syscall
+    lea rsi, [log_vt_away]
+    mov rdx, log_vt_away_len
+    call write_stderr
+.vc_out:
     ret
 
 ; install_exit_handler — edi = signal number. Kernel sigaction ABI needs

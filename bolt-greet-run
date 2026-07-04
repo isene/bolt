@@ -20,7 +20,10 @@ if [ -n "$(ls /tmp/.X11-unix/ 2>/dev/null)" ] && [ "${GREET_FORCE:-0}" != "1" ];
 fi
 
 : > "$LOG"
-/usr/local/bin/bolt-greet --tz "$(date +%z)" "$@" 2> >(tee -a "$LOG" >&2)
+# Own VT number: evdev input is global, so bolt-greet gates keys on the
+# active VT and hands the display back when you switch away (Alt+F-keys).
+VT=$(tty 2>/dev/null | grep -o '[0-9]*$')
+/usr/local/bin/bolt-greet --tz "$(date +%z)" --vt "${VT:-0}" "$@" 2> >(tee -a "$LOG" >&2)
 rc=$?
 # The greeter reads keyboards via evdev; the same keystrokes also landed in
 # this VT's tty buffer. Drain them so they don't execute in the shell.

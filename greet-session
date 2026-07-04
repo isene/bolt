@@ -18,7 +18,10 @@ if [ "$CH" = "1" ]; then
     # frame brings its own DRM + input handling; the script starts tile and
     # the full ~/.tilerc autostart as $U. GREETER=1 = non-interactive exit
     # (no "restart gdm?" prompt — control returns to bolt-greet instead).
-    GREETER=1 exec bash "$UHOME/Main/G/GIT-isene/frame/test/desktop-on-frame.sh"
+    # HOME: bolt-greet's children get HOME=/root; the script builds every
+    # binary path from $HOME (BASE="$HOME/Main/...") — without this it
+    # exits instantly on "missing binary" (the press-1-flicker).
+    GREETER=1 HOME="$UHOME" exec bash "$UHOME/Main/G/GIT-isene/frame/test/desktop-on-frame.sh"
 fi
 
 # --- X sessions: root Xorg + user session, same privileged/unprivileged
