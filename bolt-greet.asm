@@ -37,6 +37,8 @@
 %define SYS_WAIT4         61
 %define SYS_RT_SIGACTION  13
 %define SYS_FLOCK         73
+%define VT_ACTIVATE       0x5606
+%define VT_WAITACTIVE     0x5607
 %define SYS_RT_SIGRETURN  15
 %define SA_RESTORER       0x04000000
 %define SYS_TIME          201
@@ -149,6 +151,7 @@ arg_tz:         db "--tz", 0
 arg_vt:         db "--vt", 0
 path_vt_active: db "/sys/class/tty/tty0/active", 0
 path_lock:      db "/run/bolt-greet.lock", 0
+path_tty0:      db "/dev/tty0", 0
 
 log_start:      db "bolt-greet: starting", 10
 log_start_len   equ $ - log_start
@@ -187,6 +190,8 @@ log_vt_back:    db "bolt-greet: VT back, re-took display", 10
 log_vt_back_len equ $ - log_vt_back
 log_dup:        db "bolt-greet: another instance is already running", 10
 log_dup_len     equ $ - log_dup
+log_chvt:       db "bolt-greet: activated own VT", 10
+log_chvt_len    equ $ - log_chvt
 str_x:          db "x", 0
 str_nl:         db 10, 0
 
@@ -415,6 +420,9 @@ greeter_loop:
     push rbx
     call init_input
     call vt_watch_init                  ; /sys active-VT watch (POLLPRI)
+    call vt_claim                       ; not on the active VT? chvt to ours
+                                        ; (stopping gdm switches the VT away,
+                                        ; leaving the fresh greeter invisible)
     xor ebx, ebx                        ; first-frame flag (log "menu up" once)
 .gl_iter:
     cmp byte [vt_active], 1
@@ -1672,6 +1680,42 @@ vt_watch_init:
     sete al
     mov [vt_active], al
 .vw_out:
+    ret
+
+; vt_claim — if we own a VT and it is not the active one, VT_ACTIVATE it
+; (what every display manager does at startup). No-op when already active
+; or gating is disabled.
+vt_claim:
+    cmp dword [own_vt], 0
+    je  .vcl_out
+    cmp byte [vt_active], 1
+    je  .vcl_out
+    mov rax, SYS_OPEN
+    lea rdi, [path_tty0]
+    mov esi, O_RDWR
+    xor edx, edx
+    syscall
+    test rax, rax
+    js  .vcl_out
+    push rax
+    mov rdi, rax
+    mov rax, SYS_IOCTL
+    mov esi, VT_ACTIVATE
+    mov edx, [own_vt]
+    syscall
+    mov rdi, [rsp]
+    mov rax, SYS_IOCTL
+    mov esi, VT_WAITACTIVE
+    mov edx, [own_vt]
+    syscall
+    pop rdi
+    mov rax, SYS_CLOSE
+    syscall
+    mov byte [vt_active], 1
+    lea rsi, [log_chvt]
+    mov rdx, log_chvt_len
+    call write_stderr
+.vcl_out:
     ret
 
 ; vt_read_active — pread the watch file, parse "ttyN" → eax = N (0 on error).
