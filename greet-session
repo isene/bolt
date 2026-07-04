@@ -105,6 +105,7 @@ setsid runuser -u "$U" -- env \
     XDG_DATA_DIRS="/usr/local/share:/usr/share" \
     LANG=en_US.UTF-8 XDG_SESSION_TYPE=x11 \
     MOZ_DISABLE_CONTENT_SANDBOX=1 \
+    TILE_STRACE=1 \
     "${SESSION[@]}" &
 SPID=$!
 # TEMP DIAGNOSTIC: snapshot WS/tray/Mod4 ground truth 10s into the session
