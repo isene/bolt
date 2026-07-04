@@ -34,6 +34,9 @@
 %define SYS_EXECVE        59
 %define SYS_EXIT          60
 %define SYS_WAIT4         61
+%define SYS_RT_SIGACTION  13
+%define SYS_RT_SIGRETURN  15
+%define SA_RESTORER       0x04000000
 %define SYS_TIME          201
 
 %define O_RDONLY          0
@@ -73,6 +76,7 @@
 %define MAX_INPUTS      16
 %define EV_KEY          1
 ; keycodes (linux/input-event-codes.h)
+%define KEY_ESC     1
 %define KEY_1       2
 %define KEY_2       3
 %define KEY_3       4
@@ -148,10 +152,35 @@ log_start:      db "bolt-greet: starting", 10
 log_start_len   equ $ - log_start
 log_nodrm:      db "bolt-greet: DRM init failed (need root, gdm stopped)", 10
 log_nodrm_len   equ $ - log_nodrm
+log_nomaster:   db "bolt-greet: SET_MASTER failed (another display server running?)", 10
+log_nomaster_len equ $ - log_nomaster
 log_fbtest:     db "bolt-greet: fbtest frame -> /tmp/greet_fb.raw", 10
 log_fbtest_len  equ $ - log_fbtest
-log_launch:     db "bolt-greet: launching session ", 10
+log_launch:     db "bolt-greet: launching session", 10
 log_launch_len  equ $ - log_launch
+log_card:       db "bolt-greet: opened ", 0
+log_master:     db "bolt-greet: DRM master ok", 10
+log_master_len  equ $ - log_master
+log_mode_pre:   db "bolt-greet: mode ", 0
+log_setcrtc:    db "bolt-greet: SETCRTC ok", 10
+log_setcrtc_len equ $ - log_setcrtc
+log_wall_ok:    db "bolt-greet: wallpaper ok", 10
+log_wall_ok_len equ $ - log_wall_ok
+log_wall_no:    db "bolt-greet: no wallpaper (solid bg)", 10
+log_wall_no_len equ $ - log_wall_no
+log_inputs:     db "bolt-greet: input devices: ", 0
+log_menu_up:    db "bolt-greet: menu up", 10
+log_menu_up_len equ $ - log_menu_up
+log_esc:        db "bolt-greet: exit (Esc)", 10
+log_esc_len     equ $ - log_esc
+log_sig:        db "bolt-greet: signal, restoring console", 10
+log_sig_len     equ $ - log_sig
+log_devdrop:    db "bolt-greet: dropped dead input fd", 10
+log_devdrop_len equ $ - log_devdrop
+log_reassert:   db "bolt-greet: reassert CRTC after suspend", 10
+log_reassert_len equ $ - log_reassert
+str_x:          db "x", 0
+str_nl:         db 10, 0
 
 section .bss
     align 8
@@ -181,7 +210,6 @@ drm_propvals_arr: resq DRM_MAX_PROPS
 drm_encoder_buf: resb 20
 drm_crtc_save:  resb 104
 drm_crtc_set:   resb 104
-drm_crtc_probe: resb 104
 drm_dumb_create: resb 32
 drm_dumb_map:   resb 16
 drm_fb_cmd:     resb 28
@@ -220,6 +248,8 @@ filebuf:        resb 64
 footer_buf:     resb 128
 gs_argv:        resq 3
 wait_status:    resd 1
+sig_sa_buf:     resb 32
+lognum_buf:     resb 16
 
 section .text
 global _start
@@ -262,6 +292,15 @@ _start:
     mov rdx, log_start_len
     call write_stderr
 
+    ; Ctrl+C / kill / hangup restore the console CRTC and exit — a wedged
+    ; or invisible greeter must never need a hard reboot.
+    mov edi, 2                          ; SIGINT
+    call install_exit_handler
+    mov edi, 15                         ; SIGTERM
+    call install_exit_handler
+    mov edi, 1                          ; SIGHUP
+    call install_exit_handler
+
     cmp byte [fbtest_mode], 0
     jne .fbtest_path
 
@@ -269,7 +308,21 @@ _start:
     test rax, rax
     js  .drm_fail
     call load_wallpaper
-    call greeter_loop                   ; never returns except on fatal
+    cmp byte [wallpaper_ok], 0
+    je  .st_wall_no
+    lea rsi, [log_wall_ok]
+    mov rdx, log_wall_ok_len
+    call write_stderr
+    jmp .st_wall_done
+.st_wall_no:
+    lea rsi, [log_wall_no]
+    mov rdx, log_wall_no_len
+    call write_stderr
+.st_wall_done:
+    call greeter_loop                   ; returns on Esc
+    lea rsi, [log_esc]
+    mov rdx, log_esc_len
+    call write_stderr
     call drm_teardown
     mov rax, SYS_EXIT
     xor edi, edi
@@ -303,11 +356,18 @@ _start:
 greeter_loop:
     push rbx
     call init_input
+    xor ebx, ebx                        ; first-frame flag (log "menu up" once)
 .gl_iter:
-    call drm_check_reassert             ; VT switch stole the CRTC? take it back
     call update_clock
     call update_battery
     call render_frame
+    call flush_fb                       ; write-back caches → RAM for scanout
+    test ebx, ebx
+    jnz .gl_poll
+    inc ebx
+    lea rsi, [log_menu_up]
+    mov rdx, log_menu_up_len
+    call write_stderr
 .gl_poll:
     call build_pollfds
     mov rax, SYS_POLL
@@ -318,9 +378,11 @@ greeter_loop:
     test rax, rax
     jz  .gl_iter                        ; timeout → refresh clock/battery
     js  .gl_poll                        ; EINTR
-    call drain_input                    ; eax: 0 none, 1-3 launch, 10 susp, 11 off
-    test eax, eax
+    call drain_input                    ; eax: 0 none, 1-3 launch, 10 susp,
+    test eax, eax                       ;      11 off, 20 esc
     jz  .gl_iter
+    cmp eax, 20
+    je  .gl_exit
     cmp eax, 10
     je  .gl_suspend
     cmp eax, 11
@@ -330,14 +392,18 @@ greeter_loop:
     call launch_session
     call drm_init
     test rax, rax
-    js  .gl_fatal
+    js  .gl_exit
     call load_wallpaper
     call init_input
+    xor ebx, ebx
     jmp .gl_iter
 .gl_suspend:
     lea rdi, [path_systemctl]
     lea rsi, [argv_suspend]
     call run_child_wait
+    lea rsi, [log_reassert]
+    mov rdx, log_reassert_len
+    call write_stderr
     call drm_reassert                   ; repoint CRTC after resume
     jmp .gl_iter
 .gl_poweroff:
@@ -349,7 +415,8 @@ greeter_loop:
     mov rax, SYS_EXIT
     xor edi, edi
     syscall
-.gl_fatal:
+.gl_exit:
+    call close_input
     pop rbx
     ret
 
@@ -469,6 +536,12 @@ init_input:
     inc ebx
     jmp .ii_loop
 .ii_done:
+    lea rsi, [log_inputs]
+    call write_cstr_stderr
+    mov eax, [input_fd_count]
+    call write_u32_stderr
+    lea rsi, [str_nl]
+    call write_cstr_stderr
     pop r12
     pop rbx
     ret
@@ -521,6 +594,8 @@ drain_input:
     cmp ebx, [input_fd_count]
     jge .di_done
     movzx eax, word [pollfds + rbx*8 + 6]
+    test al, 0x38                       ; POLLERR|POLLHUP|POLLNVAL: dead fd —
+    jnz .di_drop                        ; close + remove or poll spins forever
     test al, 1                          ; POLLIN
     jz  .di_next
     mov r12d, [input_fds + rbx*4]
@@ -552,6 +627,22 @@ drain_input:
 .di_ev_next:
     add r13, 24
     jmp .di_ev
+.di_drop:
+    ; close the dead fd, swap the last entry into this slot, retry the slot
+    mov edi, [input_fds + rbx*4]
+    mov rax, SYS_CLOSE
+    syscall
+    mov eax, [input_fd_count]
+    dec eax
+    mov [input_fd_count], eax
+    mov ecx, [input_fds + rax*4]
+    mov [input_fds + rbx*4], ecx
+    movzx ecx, word [pollfds + rax*8 + 6]
+    mov [pollfds + rbx*8 + 6], cx
+    lea rsi, [log_devdrop]
+    mov rdx, log_devdrop_len
+    call write_stderr
+    jmp .di_dev                         ; same index now holds the swapped fd
 .di_next:
     inc ebx
     jmp .di_dev
@@ -569,6 +660,8 @@ drain_input:
 ; returns 1..3 launch, 10 suspend, 11 poweroff.
 ; ============================================================================
 handle_key:
+    cmp edx, KEY_ESC
+    je  .hk_esc
     cmp edx, KEY_UP
     je  .hk_up
     cmp edx, KEY_K
@@ -628,6 +721,9 @@ handle_key:
     ret
 .hk_power:
     mov eax, 11
+    ret
+.hk_esc:
+    mov eax, 20
     ret
 
 ; ============================================================================
@@ -1429,6 +1525,12 @@ drm_init:
     test rax, rax
     js  .di_fail
     mov [drm_fd], rax
+    lea rsi, [log_card]
+    call write_cstr_stderr
+    lea rsi, [drm_card_path]
+    call write_cstr_stderr
+    lea rsi, [str_nl]
+    call write_cstr_stderr
     ; SET_MASTER
     mov rax, SYS_IOCTL
     mov rdi, [drm_fd]
@@ -1436,7 +1538,10 @@ drm_init:
     xor edx, edx
     syscall
     test rax, rax
-    js  .di_close_fail
+    js  .di_master_fail
+    lea rsi, [log_master]
+    mov rdx, log_master_len
+    call write_stderr
     ; resources
     call drm_get_resources
     test rax, rax
@@ -1485,6 +1590,16 @@ drm_init:
     mov [fb_w], eax
     movzx eax, word [drm_modes_buf + 14] ; vdisplay
     mov [fb_h], eax
+    lea rsi, [log_mode_pre]
+    call write_cstr_stderr
+    mov eax, [fb_w]
+    call write_u32_stderr
+    lea rsi, [str_x]
+    call write_cstr_stderr
+    mov eax, [fb_h]
+    call write_u32_stderr
+    lea rsi, [str_nl]
+    call write_cstr_stderr
     ; CREATE_DUMB
     lea rdi, [drm_dumb_create]
     xor eax, eax
@@ -1566,8 +1681,15 @@ drm_init:
     call drm_reassert
     test rax, rax
     js  .di_close_fail
+    lea rsi, [log_setcrtc]
+    mov rdx, log_setcrtc_len
+    call write_stderr
     xor eax, eax
     jmp .di_out
+.di_master_fail:
+    lea rsi, [log_nomaster]
+    mov rdx, log_nomaster_len
+    call write_stderr
 .di_close_fail:
     mov rax, SYS_IOCTL
     mov rdi, [drm_fd]
@@ -1585,29 +1707,57 @@ drm_init:
     pop rbx
     ret
 
-; drm_check_reassert — read-only GETCRTC; if the CRTC's fb is no longer ours
-; (VT switch let fbcon take the display), SETCRTC it back. Zero modeset work
-; in the common case — just one read ioctl per redraw.
-drm_check_reassert:
-    lea rdi, [drm_crtc_probe]
-    xor eax, eax
-    mov ecx, 13
-    rep stosq
-    mov eax, [drm_chosen_crtc]
-    mov [drm_crtc_probe + 12], eax
-    mov rax, SYS_IOCTL
-    mov rdi, [drm_fd]
-    mov esi, DRM_IOCTL_MODE_GETCRTC
-    lea rdx, [drm_crtc_probe]
-    syscall
-    test rax, rax
-    js  .cr_out                         ; probe failed → leave it alone
-    mov eax, [drm_crtc_probe + 16]      ; current fb_id
-    cmp eax, [drm_fb_id]
-    je  .cr_out
-    call drm_reassert
-.cr_out:
+; flush_fb — clflush the whole framebuffer so the display engine scans
+; fresh pixels (frame's compositor does the same after every composite;
+; small cached writes — glyphs, fills — are NOT guaranteed to reach RAM
+; otherwise). ~9 MB per redraw; redraws happen per keypress / 30 s tick.
+flush_fb:
+    mov rdi, [fb_addr]
+    mov rcx, [fb_size]
+.ff_loop:
+    clflush [rdi]
+    add rdi, 64
+    sub rcx, 64
+    ja  .ff_loop
+    sfence
     ret
+
+; install_exit_handler — edi = signal number. Kernel sigaction ABI needs
+; SA_RESTORER + trampoline (libc-free). Lifted from frame.
+install_exit_handler:
+    push rdi
+    lea rdi, [sig_sa_buf]
+    lea rax, [exit_handler]
+    mov [rdi + 0], rax                  ; sa_handler
+    mov qword [rdi + 8], SA_RESTORER    ; sa_flags
+    lea rax, [sig_restorer]
+    mov [rdi + 16], rax                 ; sa_restorer
+    mov qword [rdi + 24], 0             ; sa_mask
+    pop rdi
+    mov rax, SYS_RT_SIGACTION
+    lea rsi, [sig_sa_buf]
+    xor edx, edx
+    mov r10, 8
+    syscall
+    ret
+
+sig_restorer:
+    mov rax, SYS_RT_SIGRETURN
+    syscall
+
+; exit_handler — Ctrl+C / kill / hangup: restore the console CRTC, drop
+; master, exit. Raw syscalls only — async-signal-safe.
+exit_handler:
+    lea rsi, [log_sig]
+    mov rdx, log_sig_len
+    call write_stderr
+    cmp byte [fbtest_mode], 0
+    jne .eh_out
+    call drm_teardown
+.eh_out:
+    mov rax, SYS_EXIT
+    xor edi, edi
+    syscall
 
 ; drm_reassert — SETCRTC our fb (used at init and after suspend/resume).
 drm_reassert:
@@ -1923,3 +2073,27 @@ write_stderr:
     mov edi, 2
     syscall
     ret
+
+; write_cstr_stderr — rsi = NUL-terminated string.
+write_cstr_stderr:
+    push rbx
+    mov rbx, rsi
+    xor edx, edx
+.wc_len:
+    cmp byte [rbx + rdx], 0
+    je  .wc_emit
+    inc edx
+    jmp .wc_len
+.wc_emit:
+    call write_stderr
+    pop rbx
+    ret
+
+; write_u32_stderr — eax = number, decimal to stderr.
+write_u32_stderr:
+    lea rdi, [lognum_buf]
+    call u32_to_ascii
+    lea rsi, [lognum_buf]
+    mov rdx, rdi
+    sub rdx, rsi
+    jmp write_stderr

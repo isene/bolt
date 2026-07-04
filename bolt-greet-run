@@ -1,6 +1,19 @@
 #!/bin/bash
-# bolt-greet-run — start bolt-greet with the local UTC offset. bolt-greet
-# carries no TZif parser (it would dwarf the greeter), so the shell hands it
-# `date +%z` once at startup. DST flips get picked up on the next greeter
-# start, which is the next boot/logout — good enough.
-exec /usr/local/bin/bolt-greet --tz "$(date +%z)" "$@"
+# bolt-greet-run — start bolt-greet with the local UTC offset, logging every
+# stage to /tmp/bolt-greet.log so a black screen still leaves evidence.
+#
+# bolt-greet carries no TZif parser (it would dwarf the greeter), so the
+# shell hands it `date +%z` once at startup. DST flips get picked up on the
+# next greeter start.
+#
+# Recovery from a VT test: Esc exits the menu; Ctrl+C restores the console
+# (signal handler tears down DRM). Worst case, switch VT and read the log.
+LOG=/tmp/bolt-greet.log
+: > "$LOG"
+/usr/local/bin/bolt-greet --tz "$(date +%z)" "$@" 2> >(tee -a "$LOG" >&2)
+rc=$?
+# The greeter reads keyboards via evdev; the same keystrokes also landed in
+# this VT's tty buffer. Drain them so they don't execute in the shell.
+while read -r -t 0.1 _ 2>/dev/null; do :; done
+echo "bolt-greet exited ($rc) — log: $LOG"
+exit $rc
