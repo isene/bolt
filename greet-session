@@ -93,6 +93,14 @@ setsid runuser -u "$U" -- env \
     MOZ_DISABLE_CONTENT_SANDBOX=1 \
     "${SESSION[@]}" &
 SPID=$!
+# TEMP DIAGNOSTIC: snapshot WS/tray/Mod4 ground truth 10s into the session
+# (remove once the tile-on-X breakage is solved).
+if [ -x "$UHOME/bin/greet-probe" ]; then
+    ( sleep 10
+      runuser -u "$U" -- env DISPLAY=:0 XAUTHORITY="$XAUTH" HOME="$UHOME" \
+          DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$UID_N/bus" \
+          "$UHOME/bin/greet-probe" ) &
+fi
 wait "$SPID"
 ts "session ended"
 
