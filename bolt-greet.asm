@@ -37,6 +37,7 @@
 %define SYS_WAIT4         61
 %define SYS_RT_SIGACTION  13
 %define SYS_FLOCK         73
+%define SYS_FCNTL         72
 %define VT_ACTIVATE       0x5606
 %define VT_WAITACTIVE     0x5607
 %define SYS_RT_SIGRETURN  15
@@ -346,12 +347,20 @@ _start:
     mov esi, 6                          ; LOCK_EX|LOCK_NB
     syscall
     test rax, rax
-    jns .lock_done
+    jns .lock_cloexec
     lea rsi, [log_dup]
     mov rdx, log_dup_len
     call write_stderr
     mov rax, SYS_EXIT
     mov edi, 1
+    syscall
+.lock_cloexec:
+    ; CLOEXEC: sessions must NOT inherit the lock fd — a surviving session
+    ; process would keep the flock held long after the greeter exits
+    ; ("another instance is already running" with no greeter alive).
+    mov rax, SYS_FCNTL
+    mov esi, 2                          ; F_SETFD
+    mov edx, 1                          ; FD_CLOEXEC
     syscall
 .lock_done:
 
@@ -1675,6 +1684,11 @@ vt_watch_init:
     test rax, rax
     js  .vw_out                         ; no sysfs? gating disabled
     mov [vt_fd], eax
+    mov edi, eax                        ; CLOEXEC — don't leak into sessions
+    mov rax, SYS_FCNTL
+    mov esi, 2
+    mov edx, 1
+    syscall
     call vt_read_active
     cmp eax, [own_vt]
     sete al
