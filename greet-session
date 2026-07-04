@@ -66,6 +66,20 @@ if [ "$XOK" != "1" ]; then
 fi
 ts "Xorg up"
 
+# Warm up RandR before the WM starts: a fresh modesetting Xorg may not have
+# probed connectors yet, and tile's output discovery then falls back
+# (src=F) — its fallback path desyncs the X connection (dead Mod4, no WS
+# properties, sluggish session). Query until the panel shows as connected;
+# gdm never hits this because its Xorg is up long before the session.
+for _ in $(seq 1 30); do
+    runuser -u "$U" -- env DISPLAY=:0 XAUTHORITY="$XAUTH" xrandr --query \
+        2>/dev/null | grep -q ' connected' && break
+    sleep 0.1
+done
+runuser -u "$U" -- env DISPLAY=:0 XAUTHORITY="$XAUTH" xrandr --query \
+    2>/dev/null | grep ' connected' | head -2 >&2
+ts "RandR ready"
+
 if [ "$CH" = "3" ]; then
     # i3 safeguard: its own config execs ~/bin/xps14 (the X prologue), so
     # run it plain — wrapping it here ran xps14 twice.
