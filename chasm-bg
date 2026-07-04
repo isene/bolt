@@ -1,0 +1,43 @@
+#!/bin/bash
+# chasm-bg <image> — one image, every CHasm background.
+#
+# The suite's binaries ship no image decoders (a PNG stack in each asm tool
+# would dwarf them), so backgrounds are pre-baked raw buffers. This bakes
+# them all from one source image:
+#
+#   ~/.framebg      raw BGRX at panel res — frame's compositor wallpaper
+#                   AND bolt-greet's greeter background (both mmap it)
+#   ~/.lockbg.rgb   raw RGB  at panel res — bolt's screen-locker background
+#
+# and points ~/.framerc / ~/.lockrc at them if they don't already.
+# Fill semantics match feh --bg-fill: scale to cover, centre-crop.
+# Re-run after changing image or panel res. Replaces frame-bg + boltimage.sh.
+set -e
+img="${1:?usage: chasm-bg <image>}"
+[ -r "$img" ] || { echo "chasm-bg: not readable: $img" >&2; exit 1; }
+command -v convert >/dev/null || { echo "chasm-bg: ImageMagick convert required" >&2; exit 1; }
+
+# Panel res: ask a running X/frame, else default to this laptop's panel.
+dim=$(xdpyinfo 2>/dev/null | awk '/dimensions:/{print $2; exit}')
+: "${dim:=1920x1200}"
+w=${dim%x*}; h=${dim#*x}
+
+framebg="$HOME/.framebg"
+lockbg="$HOME/.lockbg.rgb"
+
+convert "$img" -resize "${w}x${h}^" -gravity center -extent "${w}x${h}" "bgra:$framebg"
+convert "$img" -resize "${w}x${h}^" -gravity center -extent "${w}x${h}" -depth 8 "rgb:$lockbg"
+echo "chasm-bg: wrote $framebg ($(stat -c %s "$framebg") bytes, ${w}x${h}, frame + greeter)"
+echo "chasm-bg: wrote $lockbg ($(stat -c %s "$lockbg") bytes, ${w}x${h}, bolt locker)"
+
+rc="$HOME/.framerc"
+if ! grep -q '^[[:space:]]*background[[:space:]]*=' "$rc" 2>/dev/null; then
+    printf 'background = %s\n' "$framebg" >> "$rc"
+    echo "chasm-bg: added 'background = $framebg' to $rc"
+fi
+rc="$HOME/.lockrc"
+if ! grep -q '^[[:space:]]*bg_image[[:space:]]*=' "$rc" 2>/dev/null; then
+    printf 'bg_image = %s\n' "$lockbg" >> "$rc"
+    echo "chasm-bg: added 'bg_image = $lockbg' to $rc"
+fi
+echo "chasm-bg: applies on next frame start / bolt lock / greeter draw."

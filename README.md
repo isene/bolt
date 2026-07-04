@@ -96,12 +96,13 @@ overlay, no font rendering. You compose the entire lock screen
 (wallpaper + logo + tagline + whatever else) in your favourite
 image editor, then bake it once.
 
-A helper script ships with the repo (`boltimage.sh`) that resizes any
-PNG to 1920×1200 (configurable), pads with the bg_color, and writes
-`~/.lockbg.rgb`:
+A helper script ships with the repo (`chasm-bg`) that bakes ALL the
+suite's backgrounds from one image — `~/.lockbg.rgb` for the locker
+plus `~/.framebg` for frame's compositor and the bolt-greet greeter
+(scale-to-cover, centre-crop, panel resolution):
 
 ```bash
-./boltimage.sh ~/lockscreen-source.png    # → ~/.lockbg.rgb
+./chasm-bg ~/wallpaper.png    # → ~/.lockbg.rgb + ~/.framebg
 ```
 
 Then point `~/.lockrc` at it:
@@ -161,7 +162,7 @@ via evdev. ~25 KB static ELF, zero dependencies.
   `2` tile on X, `3` i3 on X (safeguard)
 - `s` suspend, `p` power off; arrows/`jk` + Enter to choose
 - Shows clock, date, battery; wallpaper from `~/.framebg` (same raw
-  BGRX baked by `frame-bg`)
+  BGRX baked by `chasm-bg`)
 - Font: Lat15-Fixed16 (X11 misc-fixed, public domain), baked into
   the binary via `greetfont.inc` — no font files at runtime
 
