@@ -64,6 +64,7 @@
 %define DRM_IOCTL_MODE_CREATE_DUMB     0xC02064B2
 %define DRM_IOCTL_MODE_MAP_DUMB        0xC01064B3
 %define DRM_IOCTL_MODE_DESTROY_DUMB    0xC00464B4
+%define DRM_IOCTL_MODE_DIRTYFB         0xC01864B7
 
 %define DRM_MODE_CONNECTED   1
 %define DRM_MODE_INFO_SIZE   68
@@ -250,6 +251,8 @@ gs_argv:        resq 3
 wait_status:    resd 1
 sig_sa_buf:     resb 32
 lognum_buf:     resb 16
+    alignb 8
+dirty_cmd:      resb 24                 ; struct drm_mode_fb_dirty_cmd
 
 section .text
 global _start
@@ -361,9 +364,17 @@ greeter_loop:
     call update_clock
     call update_battery
     call render_frame
-    call flush_fb                       ; write-back caches → RAM for scanout
+    call flush_fb                       ; caches → RAM + DIRTYFB rescan
     test ebx, ebx
     jnz .gl_poll
+    ; First frame: the buffer now holds the finished menu — point the CRTC
+    ; at it (drm_init deliberately skips SETCRTC so black is never shown).
+    call drm_reassert
+    test rax, rax
+    js  .gl_exit
+    lea rsi, [log_setcrtc]
+    mov rdx, log_setcrtc_len
+    call write_stderr
     inc ebx
     lea rsi, [log_menu_up]
     mov rdx, log_menu_up_len
@@ -1677,13 +1688,9 @@ drm_init:
     js  .di_close_fail
     mov eax, [drm_fb_cmd]
     mov [drm_fb_id], eax
-    ; SETCRTC
-    call drm_reassert
-    test rax, rax
-    js  .di_close_fail
-    lea rsi, [log_setcrtc]
-    mov rdx, log_setcrtc_len
-    call write_stderr
+    ; NOTE: no SETCRTC here — greeter_loop renders the first frame into the
+    ; buffer FIRST, then drm_reassert points the CRTC at it. The panel never
+    ; shows the zeroed (black) buffer, and PSR can't freeze on an empty frame.
     xor eax, eax
     jmp .di_out
 .di_master_fail:
@@ -1707,10 +1714,12 @@ drm_init:
     pop rbx
     ret
 
-; flush_fb — clflush the whole framebuffer so the display engine scans
-; fresh pixels (frame's compositor does the same after every composite;
-; small cached writes — glyphs, fills — are NOT guaranteed to reach RAM
-; otherwise). ~9 MB per redraw; redraws happen per keypress / 30 s tick.
+; flush_fb — clflush the whole framebuffer so the writes reach RAM, then
+; DIRTYFB so the display engine actually rescans it. eDP Panel Self
+; Refresh freezes scanout on an idle screen — CPU writes to a dumb buffer
+; never show without a dirty notification (frame sidesteps this by
+; page-flipping every composite; fbcon issues dirtyfb like we do here).
+; ~9 MB per redraw; redraws happen per keypress / 30 s tick.
 flush_fb:
     mov rdi, [fb_addr]
     mov rcx, [fb_size]
@@ -1720,6 +1729,19 @@ flush_fb:
     sub rcx, 64
     ja  .ff_loop
     sfence
+    ; DIRTYFB: fb_id, flags=0, color=0, num_clips=0 (= whole fb), clips=0.
+    ; Ignore the result — drivers without dirty support return ENOSYS.
+    lea rdi, [dirty_cmd]
+    xor eax, eax
+    mov ecx, 3
+    rep stosq
+    mov eax, [drm_fb_id]
+    mov [dirty_cmd], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_DIRTYFB
+    lea rdx, [dirty_cmd]
+    syscall
     ret
 
 ; install_exit_handler — edi = signal number. Kernel sigaction ABI needs
