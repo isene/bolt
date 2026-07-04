@@ -9,6 +9,16 @@
 # Recovery from a VT test: Esc exits the menu; Ctrl+C restores the console
 # (signal handler tears down DRM). Worst case, switch VT and read the log.
 LOG=/tmp/bolt-greet.log
+
+# The kernel allows same-uid DRM master takeover, so a running Xorg/frame
+# does NOT protect itself against us — starting the greeter over a live
+# session steals the panel mid-use. Refuse unless the display is free.
+if [ -n "$(ls /tmp/.X11-unix/ 2>/dev/null)" ] && [ "${GREET_FORCE:-0}" != "1" ]; then
+    echo "bolt-greet-run: a display server is running (sockets in /tmp/.X11-unix)." >&2
+    echo "bolt-greet-run: stop it first (sudo systemctl stop gdm3), or GREET_FORCE=1 to override." >&2
+    exit 1
+fi
+
 : > "$LOG"
 /usr/local/bin/bolt-greet --tz "$(date +%z)" "$@" 2> >(tee -a "$LOG" >&2)
 rc=$?
