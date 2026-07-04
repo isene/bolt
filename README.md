@@ -2,7 +2,7 @@
 
 <img src="img/bolt.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.0-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-libcrypt-brightgreen) ![Binary](https://img.shields.io/badge/binary-~24KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600)
+![Version](https://img.shields.io/badge/version-0.1.1-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-libcrypt-brightgreen) ![Binary](https://img.shields.io/badge/binary-~24KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600)
 
 A small, fast screen locker for the **CHasm** (CHange to ASM) desktop
 suite. Two binaries:
@@ -148,6 +148,44 @@ tagline lives in your baked PNG.
   another client already holds the grabs (another locker, an
   unresponsive app), it bails out with exit 2 rather than half-locking
   the session.
+
+## bolt-greet — the greeter (v0.1.1)
+
+A third binary: **bolt-greet**, a graphical session chooser that
+replaces the display manager. Pure asm like bolt, but it speaks no
+X11 at all — it runs *before* any session exists, drawing straight to
+the panel via DRM/KMS (frame's modeset path) and reading keyboards
+via evdev. ~25 KB static ELF, zero dependencies.
+
+- Sessions: `1` tile on [frame](https://github.com/isene/frame),
+  `2` tile on X, `3` i3 on X (safeguard)
+- `s` suspend, `p` power off; arrows/`jk` + Enter to choose
+- Shows clock, date, battery; wallpaper from `~/.framebg` (same raw
+  BGRX baked by `frame-bg`)
+- Font: Lat15-Fixed16 (X11 misc-fixed, public domain), baked into
+  the binary via `greetfont.inc` — no font files at runtime
+
+On selection it releases DRM master and runs `greet-session <n>`
+(a small bash launcher): choice 1 hands the panel to frame; 2 and 3
+start a root Xorg + the session as the user — the same privileged
+server / unprivileged session split gdm uses. When the session ends,
+bolt-greet re-takes DRM and shows the menu again.
+
+```bash
+make bolt-greet             # build
+./bolt-greet --fbtest       # headless render test (no root needed)
+sudo make install-greeter   # install binaries + systemd unit (NOT enabled)
+# hand-test from a VT first:
+sudo systemctl stop gdm3 && sudo bolt-greet-run
+# make it the boot greeter:
+sudo systemctl disable gdm3 && sudo systemctl enable bolt-greet
+sudo loginctl enable-linger <user>
+```
+
+Known limits: timezone comes from `--tz` (the `bolt-greet-run`
+wrapper passes `date +%z`; DST updates at next greeter start), and
+after a VT switch away and back the menu redraws on the next
+keypress or 30 s tick.
 
 ## Known v0.1 limits
 

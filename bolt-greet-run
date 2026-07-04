@@ -1,0 +1,6 @@
+#!/bin/bash
+# bolt-greet-run — start bolt-greet with the local UTC offset. bolt-greet
+# carries no TZif parser (it would dwarf the greeter), so the shell hands it
+# `date +%z` once at startup. DST flips get picked up on the next greeter
+# start, which is the next boot/logout — good enough.
+exec /usr/local/bin/bolt-greet --tz "$(date +%z)" "$@"

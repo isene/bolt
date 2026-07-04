@@ -1,0 +1,1925 @@
+; ============================================================================
+; bolt-greet — pure x86_64 asm graphical greeter (session chooser) for the
+; CHasm suite. No libc, no X11, single static ELF. Runs on a bare VT via
+; DRM/KMS (frame's modeset path) + evdev, draws the ~/.framebg wallpaper with
+; a session menu, and on selection releases DRM and runs greet-session with
+; the chosen session. When the session exits it re-inits DRM and shows the
+; menu again — the login gate that replaces gdm.
+;
+;   Sessions:  1) tile on frame   2) tile on X   3) i3 on X (safeguard)
+;   Actions :  s) suspend         p) power off
+;   Shows   :  clock, date, battery
+;
+; DRM ioctl sequences + connector/mode discovery are lifted from frame.asm's
+; proven do_modeset path. Font is Lat15-Fixed16 (X11 misc-fixed, public
+; domain), baked in via greetfont.inc.
+;
+; Build:  nasm -f elf64 bolt-greet.asm -o bolt-greet.o && ld bolt-greet.o -o bolt-greet
+; Test :  ./bolt-greet --fbtest   (anon 1920x1200 buffer, render one frame to
+;                                  /tmp/greet_fb.raw, exit — no root needed)
+; Run  :  sudo ./bolt-greet       (from a text VT with gdm stopped)
+; ============================================================================
+
+; ---- syscalls -------------------------------------------------------------
+%define SYS_READ          0
+%define SYS_WRITE         1
+%define SYS_OPEN          2
+%define SYS_CLOSE         3
+%define SYS_POLL          7
+%define SYS_MMAP          9
+%define SYS_MUNMAP        11
+%define SYS_IOCTL         16
+%define SYS_NANOSLEEP     35
+%define SYS_FORK          57
+%define SYS_EXECVE        59
+%define SYS_EXIT          60
+%define SYS_WAIT4         61
+%define SYS_TIME          201
+
+%define O_RDONLY          0
+%define O_WRONLY          1
+%define O_RDWR            0x2
+%define O_CREAT           0x40
+%define O_TRUNC           0x200
+%define O_NONBLOCK        0x800
+
+%define PROT_RW           3
+%define MAP_SHARED        1
+%define MAP_PRIVATE       2
+%define MAP_ANONYMOUS     0x20
+
+; ---- DRM ioctls (lifted from frame.asm) -----------------------------------
+%define DRM_IOCTL_SET_MASTER           0x0000641E
+%define DRM_IOCTL_DROP_MASTER          0x0000641F
+%define DRM_IOCTL_MODE_GETRESOURCES    0xC04064A0
+%define DRM_IOCTL_MODE_GETCRTC         0xC06864A1
+%define DRM_IOCTL_MODE_SETCRTC         0xC06864A2
+%define DRM_IOCTL_MODE_GETENCODER      0xC01464A6
+%define DRM_IOCTL_MODE_GETCONNECTOR    0xC05064A7
+%define DRM_IOCTL_MODE_ADDFB           0xC01C64AE
+%define DRM_IOCTL_MODE_RMFB            0xC00464AF
+%define DRM_IOCTL_MODE_CREATE_DUMB     0xC02064B2
+%define DRM_IOCTL_MODE_MAP_DUMB        0xC01064B3
+%define DRM_IOCTL_MODE_DESTROY_DUMB    0xC00464B4
+
+%define DRM_MODE_CONNECTED   1
+%define DRM_MODE_INFO_SIZE   68
+%define DRM_MAX_MODES        64
+%define DRM_MAX_PROPS        64
+%define DRM_MAX_IDS          32
+
+; ---- evdev ----------------------------------------------------------------
+%define INPUT_DEV_MAX   32
+%define MAX_INPUTS      16
+%define EV_KEY          1
+; keycodes (linux/input-event-codes.h)
+%define KEY_1       2
+%define KEY_2       3
+%define KEY_3       4
+%define KEY_P       25
+%define KEY_S       31
+%define KEY_J       36
+%define KEY_K       37
+%define KEY_ENTER   28
+%define KEY_KPENTER 96
+%define KEY_UP      103
+%define KEY_DOWN    108
+
+; ---- layout / colours (memory dwords are X,R,G,B little-endian = B,G,R,X) --
+%define PANEL_W     760
+%define PANEL_H     520
+%define COL_ACCENT  0x00E8890F      ; warm orange
+%define COL_TEXT    0x00EAEAEA
+%define COL_DIM     0x00909090
+%define COL_SELTEXT 0x00101010      ; text on the accent bar
+%define COL_BG      0x00101418      ; fallback bg if no wallpaper
+
+section .rodata
+%include "greetfont.inc"            ; greet_font: 95 glyphs, ASCII 32..126, 8x16
+
+str_title:      db "CHasm", 0
+str_subtitle:   db "choose a session", 0
+str_row0:       db "1   tile on frame", 0
+str_row1:       db "2   tile on X", 0
+str_row2:       db "3   i3 on X", 0
+str_buttons:    db "[s] suspend      [p] power off", 0
+str_sep:        db "   ", 0
+str_bat:        db "BAT ", 0
+str_pctsp:      db "% ", 0
+str_nobat:      db "AC", 0
+str_chg:        db "chg", 0
+str_dis:        db "bat", 0
+str_full:       db "full", 0
+
+wday_names:     db "Thu",0, "Fri",0, "Sat",0, "Sun",0, "Mon",0, "Tue",0, "Wed",0
+                ; indexed by (days_since_epoch % 7): 1970-01-01 was a Thursday
+mon_names:      db "Jan",0, "Feb",0, "Mar",0, "Apr",0, "May",0, "Jun",0
+                db "Jul",0, "Aug",0, "Sep",0, "Oct",0, "Nov",0, "Dec",0
+
+path_framebg:   db "/home/geir/.framebg", 0
+input_dev_pre:  db "/dev/input/event", 0
+path_bat0_cap:  db "/sys/class/power_supply/BAT0/capacity", 0
+path_bat0_stat: db "/sys/class/power_supply/BAT0/status", 0
+path_bat1_cap:  db "/sys/class/power_supply/BAT1/capacity", 0
+path_bat1_stat: db "/sys/class/power_supply/BAT1/status", 0
+path_fbtest_out: db "/tmp/greet_fb.raw", 0
+
+; children
+path_systemctl: db "/usr/bin/systemctl", 0
+path_greetsess: db "/usr/local/bin/greet-session", 0
+arg_sysctl0:    db "systemctl", 0
+arg_suspend:    db "suspend", 0
+arg_poweroff:   db "poweroff", 0
+argv_suspend:   dq arg_sysctl0, arg_suspend, 0
+argv_poweroff:  dq arg_sysctl0, arg_poweroff, 0
+arg_gs0:        db "greet-session", 0
+gs_choice1:     db "1", 0
+gs_choice2:     db "2", 0
+gs_choice3:     db "3", 0
+env_path:       db "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin", 0
+env_home:       db "HOME=/root", 0
+env_term:       db "TERM=linux", 0
+child_envp:     dq env_path, env_home, env_term, 0
+
+arg_fbtest:     db "--fbtest", 0
+arg_tz:         db "--tz", 0
+
+log_start:      db "bolt-greet: starting", 10
+log_start_len   equ $ - log_start
+log_nodrm:      db "bolt-greet: DRM init failed (need root, gdm stopped)", 10
+log_nodrm_len   equ $ - log_nodrm
+log_fbtest:     db "bolt-greet: fbtest frame -> /tmp/greet_fb.raw", 10
+log_fbtest_len  equ $ - log_fbtest
+log_launch:     db "bolt-greet: launching session ", 10
+log_launch_len  equ $ - log_launch
+
+section .bss
+    align 8
+fbtest_mode:    resb 1
+sel:            resd 1                  ; selected row 0..2
+tz_offset_min:  resd 1                  ; local-time offset, minutes east of UTC
+
+fb_addr:        resq 1
+fb_w:           resd 1
+fb_h:           resd 1
+fb_pitch:       resd 1
+fb_size:        resq 1
+
+; DRM state (struct layouts mirror frame.asm)
+drm_fd:         resq 1
+drm_card_path:  resb 32
+drm_res_buf:    resb 64
+drm_fb_ids:     resd DRM_MAX_IDS
+drm_crtc_ids:   resd DRM_MAX_IDS
+drm_conn_ids:   resd DRM_MAX_IDS
+drm_enc_ids:    resd DRM_MAX_IDS
+drm_conn_buf:   resb 80
+drm_modes_buf:  resb (DRM_MODE_INFO_SIZE * DRM_MAX_MODES)
+drm_enc_arr:    resd DRM_MAX_IDS
+drm_props_arr:  resd DRM_MAX_PROPS
+drm_propvals_arr: resq DRM_MAX_PROPS
+drm_encoder_buf: resb 20
+drm_crtc_save:  resb 104
+drm_crtc_set:   resb 104
+drm_crtc_probe: resb 104
+drm_dumb_create: resb 32
+drm_dumb_map:   resb 16
+drm_fb_cmd:     resb 28
+drm_dumb_destroy: resb 8
+drm_set_conn_id: resd 1
+drm_chosen_conn: resd 1
+drm_chosen_crtc: resd 1
+drm_fb_id:      resd 1
+drm_dumb_handle: resd 1
+drm_dumb_pitch: resd 1
+drm_dumb_size:  resq 1
+drm_dumb_offset: resq 1
+
+WALL_MAX        equ 1920*1200*4
+wallpaper_ok:   resb 1
+wallpaper_buf:  resb WALL_MAX
+
+input_fds:      resd MAX_INPUTS
+input_fd_count: resd 1
+pollfds:        resb MAX_INPUTS*8
+ev_buf:         resb 24*32
+dev_path_buf:   resb 32
+
+cur_year:       resd 1
+cur_mon:        resd 1                  ; 1..12
+cur_mday:       resd 1
+cur_wday:       resd 1                  ; index into wday_names (epoch%7)
+cur_hour:       resd 1
+cur_min:        resd 1
+
+bat_present:    resb 1
+bat_pct:        resd 1
+bat_status:     resd 1                  ; 0=dis 1=chg 2=full
+
+filebuf:        resb 64
+footer_buf:     resb 128
+gs_argv:        resq 3
+wait_status:    resd 1
+
+section .text
+global _start
+
+; ============================================================================
+; entry
+; ============================================================================
+_start:
+    mov dword [tz_offset_min], 120      ; CEST fallback if no --tz given
+    ; scan argv[1..] for --fbtest / --tz +HHMM
+    mov rbx, [rsp]                      ; argc
+    mov r12d, 1
+.arg_loop:
+    cmp r12, rbx
+    jge .arg_done
+    mov rdi, [rsp + 8 + r12*8]          ; argv[r12]
+    lea rsi, [arg_fbtest]
+    call streq_cstr
+    jne .arg_tzq
+    mov byte [fbtest_mode], 1
+    jmp .arg_next
+.arg_tzq:
+    mov rdi, [rsp + 8 + r12*8]          ; streq_cstr advanced rdi; reload
+    lea rsi, [arg_tz]
+    call streq_cstr
+    jne .arg_next
+    ; next argv = "+HHMM" / "-HHMM" (date +%z format)
+    inc r12
+    cmp r12, rbx
+    jge .arg_done
+    mov rdi, [rsp + 8 + r12*8]
+    call parse_tz
+.arg_next:
+    inc r12
+    jmp .arg_loop
+.arg_done:
+    mov dword [sel], 0
+
+    lea rsi, [log_start]
+    mov rdx, log_start_len
+    call write_stderr
+
+    cmp byte [fbtest_mode], 0
+    jne .fbtest_path
+
+    call drm_init
+    test rax, rax
+    js  .drm_fail
+    call load_wallpaper
+    call greeter_loop                   ; never returns except on fatal
+    call drm_teardown
+    mov rax, SYS_EXIT
+    xor edi, edi
+    syscall
+
+.drm_fail:
+    lea rsi, [log_nodrm]
+    mov rdx, log_nodrm_len
+    call write_stderr
+    mov rax, SYS_EXIT
+    mov edi, 1
+    syscall
+
+.fbtest_path:
+    call fbtest_init
+    call load_wallpaper
+    call update_clock
+    call update_battery
+    call render_frame
+    call fbtest_dump
+    lea rsi, [log_fbtest]
+    mov rdx, log_fbtest_len
+    call write_stderr
+    mov rax, SYS_EXIT
+    xor edi, edi
+    syscall
+
+; ============================================================================
+; greeter_loop — render, poll evdev with 30s timeout (clock tick), dispatch.
+; ============================================================================
+greeter_loop:
+    push rbx
+    call init_input
+.gl_iter:
+    call drm_check_reassert             ; VT switch stole the CRTC? take it back
+    call update_clock
+    call update_battery
+    call render_frame
+.gl_poll:
+    call build_pollfds
+    mov rax, SYS_POLL
+    lea rdi, [pollfds]
+    mov esi, [input_fd_count]
+    mov edx, 30000                      ; 30s tick for the clock
+    syscall
+    test rax, rax
+    jz  .gl_iter                        ; timeout → refresh clock/battery
+    js  .gl_poll                        ; EINTR
+    call drain_input                    ; eax: 0 none, 1-3 launch, 10 susp, 11 off
+    test eax, eax
+    jz  .gl_iter
+    cmp eax, 10
+    je  .gl_suspend
+    cmp eax, 11
+    je  .gl_poweroff
+    ; launch session eax(1..3): teardown DRM + input, run, re-init
+    call close_input
+    call launch_session
+    call drm_init
+    test rax, rax
+    js  .gl_fatal
+    call load_wallpaper
+    call init_input
+    jmp .gl_iter
+.gl_suspend:
+    lea rdi, [path_systemctl]
+    lea rsi, [argv_suspend]
+    call run_child_wait
+    call drm_reassert                   ; repoint CRTC after resume
+    jmp .gl_iter
+.gl_poweroff:
+    call drm_teardown
+    lea rdi, [path_systemctl]
+    lea rsi, [argv_poweroff]
+    call run_child_wait
+    ; if poweroff returns, machine is going down anyway — just exit
+    mov rax, SYS_EXIT
+    xor edi, edi
+    syscall
+.gl_fatal:
+    pop rbx
+    ret
+
+; ============================================================================
+; launch_session — [sel] chosen (0..2). Release DRM, exec greet-session <n>,
+; wait for it. Caller re-inits DRM after.
+; ============================================================================
+launch_session:
+    push rbx
+    lea rsi, [log_launch]
+    mov rdx, log_launch_len
+    call write_stderr
+    lea rax, [arg_gs0]
+    mov [gs_argv], rax
+    mov eax, [sel]
+    lea rcx, [gs_choice1]
+    cmp eax, 1
+    jne .ls_c2q
+    lea rcx, [gs_choice2]
+.ls_c2q:
+    cmp eax, 2
+    jne .ls_set
+    lea rcx, [gs_choice3]
+.ls_set:
+    mov [gs_argv + 8], rcx
+    mov qword [gs_argv + 16], 0
+    call drm_teardown
+    lea rdi, [path_greetsess]
+    lea rsi, [gs_argv]
+    call run_child_wait
+    pop rbx
+    ret
+
+; ============================================================================
+; run_child_wait — rdi = path, rsi = argv. fork; child execve; parent wait4.
+; ============================================================================
+run_child_wait:
+    push rbx
+    push r12
+    push r13
+    mov r12, rdi
+    mov r13, rsi
+    mov rax, SYS_FORK
+    syscall
+    test rax, rax
+    jz  .rc_child
+    js  .rc_done
+    mov rbx, rax
+.rc_wait:
+    mov rax, SYS_WAIT4
+    mov rdi, rbx
+    lea rsi, [wait_status]
+    xor edx, edx
+    xor r10d, r10d
+    syscall
+    cmp rax, -4                         ; EINTR
+    je  .rc_wait
+    jmp .rc_done
+.rc_child:
+    mov rax, SYS_EXECVE
+    mov rdi, r12
+    mov rsi, r13
+    lea rdx, [child_envp]
+    syscall
+    mov rax, SYS_EXIT
+    mov edi, 127
+    syscall
+.rc_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; init_input / close_input / build_pollfds — evdev keyboards (frame pattern)
+; ============================================================================
+init_input:
+    push rbx
+    push r12
+    lea rdi, [input_fds]
+    mov eax, -1
+    mov ecx, MAX_INPUTS
+    rep stosd
+    mov dword [input_fd_count], 0
+    xor ebx, ebx
+.ii_loop:
+    cmp ebx, INPUT_DEV_MAX
+    jge .ii_done
+    cmp dword [input_fd_count], MAX_INPUTS
+    jge .ii_done
+    ; "/dev/input/eventN"
+    lea rdi, [dev_path_buf]
+    lea rsi, [input_dev_pre]
+.ii_cp:
+    mov al, [rsi]
+    test al, al
+    jz  .ii_cp_done
+    mov [rdi], al
+    inc rsi
+    inc rdi
+    jmp .ii_cp
+.ii_cp_done:
+    mov eax, ebx
+    call u32_to_ascii
+    mov byte [rdi], 0
+    mov rax, SYS_OPEN
+    lea rdi, [dev_path_buf]
+    mov esi, O_NONBLOCK                 ; O_RDONLY|O_NONBLOCK
+    xor edx, edx
+    syscall
+    test rax, rax
+    js  .ii_next
+    mov r12d, [input_fd_count]
+    mov [input_fds + r12*4], eax
+    inc dword [input_fd_count]
+.ii_next:
+    inc ebx
+    jmp .ii_loop
+.ii_done:
+    pop r12
+    pop rbx
+    ret
+
+close_input:
+    push rbx
+    xor ebx, ebx
+.ci_loop:
+    cmp ebx, [input_fd_count]
+    jge .ci_done
+    mov edi, [input_fds + rbx*4]
+    mov rax, SYS_CLOSE
+    syscall
+    inc ebx
+    jmp .ci_loop
+.ci_done:
+    mov dword [input_fd_count], 0
+    pop rbx
+    ret
+
+build_pollfds:
+    push rbx
+    xor ebx, ebx
+.bp_loop:
+    cmp ebx, [input_fd_count]
+    jge .bp_done
+    mov eax, [input_fds + rbx*4]
+    mov [pollfds + rbx*8], eax          ; fd
+    mov word [pollfds + rbx*8 + 4], 1   ; events = POLLIN
+    mov word [pollfds + rbx*8 + 6], 0   ; revents
+    inc ebx
+    jmp .bp_loop
+.bp_done:
+    pop rbx
+    ret
+
+; ============================================================================
+; drain_input — read all readable fds; returns eax action
+; (0 none/redraw, 1..3 launch, 10 suspend, 11 poweroff).
+; ============================================================================
+drain_input:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    xor r14d, r14d
+    xor ebx, ebx
+.di_dev:
+    cmp ebx, [input_fd_count]
+    jge .di_done
+    movzx eax, word [pollfds + rbx*8 + 6]
+    test al, 1                          ; POLLIN
+    jz  .di_next
+    mov r12d, [input_fds + rbx*4]
+.di_read:
+    mov rax, SYS_READ
+    mov edi, r12d
+    lea rsi, [ev_buf]
+    mov edx, 24*32
+    syscall
+    test rax, rax
+    jle .di_next
+    mov r15, rax                        ; bytes read
+    xor r13d, r13d
+.di_ev:
+    cmp r13, r15
+    jge .di_read
+    movzx ecx, word [ev_buf + r13 + 16] ; type
+    cmp ecx, EV_KEY
+    jne .di_ev_next
+    mov ecx, [ev_buf + r13 + 20]        ; value (1=press, 2=repeat)
+    cmp ecx, 1
+    jne .di_ev_next
+    movzx edx, word [ev_buf + r13 + 18] ; keycode
+    call handle_key
+    test eax, eax
+    jz  .di_ev_next
+    mov r14d, eax
+    jmp .di_done                        ; action → stop processing
+.di_ev_next:
+    add r13, 24
+    jmp .di_ev
+.di_next:
+    inc ebx
+    jmp .di_dev
+.di_done:
+    mov eax, r14d
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; handle_key — edx = keycode. Nav updates [sel] (returns 0 → redraw);
+; returns 1..3 launch, 10 suspend, 11 poweroff.
+; ============================================================================
+handle_key:
+    cmp edx, KEY_UP
+    je  .hk_up
+    cmp edx, KEY_K
+    je  .hk_up
+    cmp edx, KEY_DOWN
+    je  .hk_down
+    cmp edx, KEY_J
+    je  .hk_down
+    cmp edx, KEY_1
+    je  .hk_s1
+    cmp edx, KEY_2
+    je  .hk_s2
+    cmp edx, KEY_3
+    je  .hk_s3
+    cmp edx, KEY_ENTER
+    je  .hk_enter
+    cmp edx, KEY_KPENTER
+    je  .hk_enter
+    cmp edx, KEY_S
+    je  .hk_suspend
+    cmp edx, KEY_P
+    je  .hk_power
+    xor eax, eax
+    ret
+.hk_up:
+    mov eax, [sel]
+    add eax, 2
+    jmp .hk_mod3
+.hk_down:
+    mov eax, [sel]
+    inc eax
+.hk_mod3:
+    xor edx, edx
+    mov ecx, 3
+    div ecx
+    mov [sel], edx
+    xor eax, eax
+    ret
+.hk_s1:
+    mov dword [sel], 0
+    mov eax, 1
+    ret
+.hk_s2:
+    mov dword [sel], 1
+    mov eax, 2
+    ret
+.hk_s3:
+    mov dword [sel], 2
+    mov eax, 3
+    ret
+.hk_enter:
+    mov eax, [sel]
+    inc eax
+    ret
+.hk_suspend:
+    mov eax, 10
+    ret
+.hk_power:
+    mov eax, 11
+    ret
+
+; ============================================================================
+; render_frame — wallpaper/bg + centered panel + text + footer.
+; ============================================================================
+render_frame:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    call draw_background
+    ; panel x/y
+    mov r12d, [fb_w]
+    sub r12d, PANEL_W
+    shr r12d, 1
+    mov r13d, [fb_h]
+    sub r13d, PANEL_H
+    shr r13d, 1
+    ; darken panel area (shift each pixel right 2 = 25% brightness)
+    mov edi, r12d
+    mov esi, r13d
+    mov edx, PANEL_W
+    mov ecx, PANEL_H
+    call darken_rect
+    ; accent top bar 4px
+    mov edi, r12d
+    mov esi, r13d
+    mov edx, PANEL_W
+    mov ecx, 4
+    mov r8d, COL_ACCENT
+    call fill_rect
+
+    ; title, scale 4, centered, y+30
+    mov edi, r12d
+    add edi, PANEL_W/2
+    mov esi, r13d
+    add esi, 30
+    lea rdx, [str_title]
+    mov ecx, 4
+    mov r8d, COL_ACCENT
+    call draw_cstr_centered
+    ; subtitle, scale 2, dim, y+110
+    mov edi, r12d
+    add edi, PANEL_W/2
+    mov esi, r13d
+    add esi, 110
+    lea rdx, [str_subtitle]
+    mov ecx, 2
+    mov r8d, COL_DIM
+    call draw_cstr_centered
+
+    ; rows, scale 3: y = panel_y + 170 + i*72
+    xor r14d, r14d
+.rf_row:
+    cmp r14d, 3
+    jge .rf_rows_done
+    mov r15d, r14d
+    imul r15d, 72
+    add r15d, r13d
+    add r15d, 170
+    cmp r14d, [sel]
+    jne .rf_no_hl
+    ; highlight bar behind selected row
+    mov edi, r12d
+    add edi, 26
+    mov esi, r15d
+    sub esi, 8
+    mov edx, PANEL_W - 52
+    mov ecx, 62
+    mov r8d, COL_ACCENT
+    call fill_rect
+.rf_no_hl:
+    mov edi, r12d
+    add edi, 60
+    mov esi, r15d
+    lea rdx, [str_row0]
+    cmp r14d, 1
+    jne .rf_l2q
+    lea rdx, [str_row1]
+.rf_l2q:
+    cmp r14d, 2
+    jne .rf_draw
+    lea rdx, [str_row2]
+.rf_draw:
+    mov ecx, 3
+    mov r8d, COL_TEXT
+    cmp r14d, [sel]
+    jne .rf_col_ok
+    mov r8d, COL_SELTEXT
+.rf_col_ok:
+    call draw_cstr
+    inc r14d
+    jmp .rf_row
+.rf_rows_done:
+    ; buttons line, scale 2, dim, y+420
+    mov edi, r12d
+    add edi, PANEL_W/2
+    mov esi, r13d
+    add esi, 420
+    lea rdx, [str_buttons]
+    mov ecx, 2
+    mov r8d, COL_DIM
+    call draw_cstr_centered
+    ; footer, scale 2, y+470
+    call build_footer
+    mov edi, r12d
+    add edi, PANEL_W/2
+    mov esi, r13d
+    add esi, 470
+    lea rdx, [footer_buf]
+    mov ecx, 2
+    mov r8d, COL_TEXT
+    call draw_cstr_centered
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; draw_background — wallpaper blit or solid fill.
+; ============================================================================
+draw_background:
+    push rbx
+    push r12
+    push r13
+    push r14
+    cmp byte [wallpaper_ok], 0
+    je  .db_solid
+    xor r12d, r12d                      ; y
+    mov r13d, [fb_h]
+    mov r14d, [fb_w]
+    shl r14d, 2                         ; src stride bytes
+.db_row:
+    cmp r12d, r13d
+    jge .db_done
+    mov eax, r12d
+    imul eax, r14d
+    lea rsi, [wallpaper_buf]
+    add rsi, rax
+    mov eax, r12d
+    imul eax, [fb_pitch]
+    mov rdi, [fb_addr]
+    add rdi, rax
+    mov ecx, r14d
+    shr ecx, 3
+    rep movsq
+    inc r12d
+    jmp .db_row
+.db_solid:
+    xor edi, edi
+    xor esi, esi
+    mov edx, [fb_w]
+    mov ecx, [fb_h]
+    mov r8d, COL_BG
+    call fill_rect
+.db_done:
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; fill_rect — edi=x esi=y edx=w ecx=h r8d=colour. Clips. Preserves r12-r15.
+; ============================================================================
+fill_rect:
+    push rbx
+    push r12
+    push r13
+    ; clip left/top
+    test edi, edi
+    jns .fr_x0
+    add edx, edi
+    xor edi, edi
+.fr_x0:
+    test esi, esi
+    jns .fr_y0
+    add ecx, esi
+    xor esi, esi
+.fr_y0:
+    mov eax, edi
+    add eax, edx
+    cmp eax, [fb_w]
+    jle .fr_xr
+    mov edx, [fb_w]
+    sub edx, edi
+.fr_xr:
+    mov eax, esi
+    add eax, ecx
+    cmp eax, [fb_h]
+    jle .fr_yr
+    mov ecx, [fb_h]
+    sub ecx, esi
+.fr_yr:
+    test edx, edx
+    jle .fr_done
+    test ecx, ecx
+    jle .fr_done
+    mov r12d, ecx                       ; rows remaining
+    ; base = fb_addr + y*pitch + x*4
+    mov eax, esi
+    imul eax, [fb_pitch]
+    mov rbx, [fb_addr]
+    add rbx, rax
+    mov eax, edi
+    shl eax, 2
+    add rbx, rax
+    mov r13d, edx                       ; width dwords
+.fr_rows:
+    mov rdi, rbx
+    mov ecx, r13d
+    mov eax, r8d
+    rep stosd
+    mov eax, [fb_pitch]
+    add rbx, rax
+    dec r12d
+    jnz .fr_rows
+.fr_done:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; darken_rect — edi=x esi=y edx=w ecx=h. Darkens pixels to 25% ((p>>2)&mask).
+; Assumes the rect is within bounds (panel is always inside). Preserves r12+.
+; ============================================================================
+darken_rect:
+    push rbx
+    push r12
+    push r13
+    push r14
+    mov r12d, ecx                       ; rows
+    mov r13d, edx                       ; width px
+    mov eax, esi
+    imul eax, [fb_pitch]
+    mov rbx, [fb_addr]
+    add rbx, rax
+    mov eax, edi
+    shl eax, 2
+    add rbx, rax
+.dk_rows:
+    mov rdi, rbx
+    mov ecx, r13d
+.dk_px:
+    mov eax, [rdi]
+    shr eax, 2
+    and eax, 0x003F3F3F                 ; keep 6 bits per channel post-shift
+    mov [rdi], eax
+    add rdi, 4
+    dec ecx
+    jnz .dk_px
+    mov eax, [fb_pitch]
+    add rbx, rax
+    dec r12d
+    jnz .dk_rows
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; draw_cstr — edi=x esi=y rdx=cstr ecx=scale r8d=colour. Draws left-aligned.
+; draw_cstr_centered — same but edi = center x.
+; ============================================================================
+draw_cstr_centered:
+    push rbx
+    push rdx
+    ; width = strlen * 8 * scale
+    mov rbx, rdx
+    xor eax, eax
+.dc_len:
+    cmp byte [rbx + rax], 0
+    je  .dc_len_done
+    inc eax
+    jmp .dc_len
+.dc_len_done:
+    imul eax, ecx
+    shl eax, 3                          ; *8
+    shr eax, 1                          ; /2
+    sub edi, eax
+    pop rdx
+    pop rbx
+    ; fallthrough
+draw_cstr:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    mov r12, rdx                        ; str
+    mov r13d, edi                       ; x cursor
+    mov r14d, esi                       ; y
+    mov r15d, ecx                       ; scale
+.ds_loop:
+    movzx eax, byte [r12]
+    test eax, eax
+    jz  .ds_done
+    mov edi, r13d
+    mov esi, r14d
+    mov ecx, r15d
+    ; r8d already colour
+    call draw_glyph                     ; eax = char
+    mov eax, r15d
+    shl eax, 3
+    add r13d, eax                       ; advance 8*scale
+    inc r12
+    jmp .ds_loop
+.ds_done:
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; draw_glyph — eax=ascii edi=x esi=y ecx=scale r8d=colour. 8x16 font, each
+; font pixel becomes scale x scale. Transparent background (skip 0 bits).
+; Preserves r12-r15.
+; ============================================================================
+draw_glyph:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    push rbp
+    sub eax, 32
+    cmp eax, 94
+    ja  .dg_done                        ; outside 32..126 → skip
+    shl eax, 4                          ; *16 bytes/glyph
+    lea rbx, [greet_font]
+    add rbx, rax                        ; glyph rows
+    mov r12d, edi                       ; x0
+    mov r13d, esi                       ; y0
+    mov r14d, ecx                       ; scale
+    xor r15d, r15d                      ; row 0..15
+.dg_row:
+    cmp r15d, 16
+    jge .dg_done
+    movzx ebp, byte [rbx + r15]         ; row bits
+    test ebp, ebp
+    jz  .dg_next_row                    ; blank row fast path
+    xor r9d, r9d                        ; col 0..7
+.dg_col:
+    cmp r9d, 8
+    jge .dg_next_row
+    mov eax, 0x80
+    mov ecx, r9d
+    shr eax, cl
+    test ebp, eax
+    jz  .dg_next_col
+    ; fill scale x scale block at (x0 + col*scale, y0 + row*scale)
+    mov edi, r9d
+    imul edi, r14d
+    add edi, r12d
+    mov esi, r15d
+    imul esi, r14d
+    add esi, r13d
+    mov edx, r14d
+    mov ecx, r14d
+    call fill_rect
+.dg_next_col:
+    inc r9d
+    jmp .dg_col
+.dg_next_row:
+    inc r15d
+    jmp .dg_row
+.dg_done:
+    pop rbp
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; build_footer — "Sat 4 Jul 2026   14:32   BAT 87% chg" into footer_buf.
+; ============================================================================
+build_footer:
+    push rbx
+    lea rbx, [footer_buf]
+    mov eax, [cur_wday]
+    lea rsi, [wday_names]
+    imul eax, 4
+    add rsi, rax
+    call fcat_cstr
+    mov byte [rbx], ' '
+    inc rbx
+    mov eax, [cur_mday]
+    call fcat_u32
+    mov byte [rbx], ' '
+    inc rbx
+    mov eax, [cur_mon]
+    dec eax
+    lea rsi, [mon_names]
+    imul eax, 4
+    add rsi, rax
+    call fcat_cstr
+    mov byte [rbx], ' '
+    inc rbx
+    mov eax, [cur_year]
+    call fcat_u32
+    lea rsi, [str_sep]
+    call fcat_cstr
+    mov eax, [cur_hour]
+    call fcat_2d
+    mov byte [rbx], ':'
+    inc rbx
+    mov eax, [cur_min]
+    call fcat_2d
+    lea rsi, [str_sep]
+    call fcat_cstr
+    cmp byte [bat_present], 0
+    je  .bf_ac
+    lea rsi, [str_bat]
+    call fcat_cstr
+    mov eax, [bat_pct]
+    call fcat_u32
+    lea rsi, [str_pctsp]
+    call fcat_cstr
+    mov eax, [bat_status]
+    lea rsi, [str_dis]
+    cmp eax, 1
+    jne .bf_full_q
+    lea rsi, [str_chg]
+.bf_full_q:
+    cmp eax, 2
+    jne .bf_emit
+    lea rsi, [str_full]
+.bf_emit:
+    call fcat_cstr
+    jmp .bf_end
+.bf_ac:
+    lea rsi, [str_nobat]
+    call fcat_cstr
+.bf_end:
+    mov byte [rbx], 0
+    pop rbx
+    ret
+
+; fcat_cstr — append cstr [rsi] at cursor rbx.
+fcat_cstr:
+    mov al, [rsi]
+    test al, al
+    jz  .fc_d
+    mov [rbx], al
+    inc rbx
+    inc rsi
+    jmp fcat_cstr
+.fc_d:
+    ret
+
+; fcat_u32 — append decimal eax at cursor rbx.
+fcat_u32:
+    push rsi
+    mov rdi, rbx
+    call u32_to_ascii
+    mov rbx, rdi
+    pop rsi
+    ret
+
+; fcat_2d — append zero-padded 2-digit eax.
+fcat_2d:
+    xor edx, edx
+    mov ecx, 10
+    div ecx
+    add al, '0'
+    mov [rbx], al
+    inc rbx
+    add dl, '0'
+    mov [rbx], dl
+    inc rbx
+    ret
+
+; ============================================================================
+; update_clock — time() → civil date/time using tz_offset_min.
+; Days-from-epoch → y/m/d via Howard Hinnant's civil_from_days algorithm.
+; ============================================================================
+update_clock:
+    push rbx
+    push r12
+    mov rax, SYS_TIME
+    xor edi, edi
+    syscall                             ; rax = unix seconds
+    ; apply tz offset
+    movsxd rcx, dword [tz_offset_min]
+    imul rcx, 60
+    add rax, rcx
+    ; split days / seconds-of-day
+    mov rcx, 86400
+    xor edx, edx
+    div rcx                             ; rax = days, rdx = secs of day
+    mov rbx, rax                        ; days since epoch
+    mov rax, rdx
+    xor edx, edx
+    mov ecx, 3600
+    div ecx
+    mov [cur_hour], eax
+    mov eax, edx
+    xor edx, edx
+    mov ecx, 60
+    div ecx
+    mov [cur_min], eax
+    ; weekday: days % 7 → wday_names index (1970-01-01 = Thu at index 0)
+    mov rax, rbx
+    xor edx, edx
+    mov ecx, 7
+    div ecx
+    mov [cur_wday], edx
+    ; civil_from_days(z = days):
+    ;   z += 719468
+    ;   era = z / 146097
+    ;   doe = z % 146097
+    ;   yoe = (doe - doe/1460 + doe/36524 - doe/146096) / 365
+    ;   y   = yoe + era*400
+    ;   doy = doe - (365*yoe + yoe/4 - yoe/100)
+    ;   mp  = (5*doy + 2)/153
+    ;   d   = doy - (153*mp+2)/5 + 1
+    ;   m   = mp + (mp < 10 ? 3 : -9)
+    ;   y  += (m <= 2)
+    mov rax, rbx
+    add rax, 719468
+    mov rcx, 146097
+    xor edx, edx
+    div rcx                             ; rax=era rdx=doe
+    mov r12, rax                        ; era
+    mov rbx, rdx                        ; doe
+    ; yoe
+    mov rax, rbx
+    mov rcx, 1460
+    xor edx, edx
+    div rcx
+    mov r8, rax                         ; doe/1460
+    mov rax, rbx
+    mov rcx, 36524
+    xor edx, edx
+    div rcx
+    mov r9, rax                         ; doe/36524
+    mov rax, rbx
+    mov rcx, 146096
+    xor edx, edx
+    div rcx
+    mov r10, rax                        ; doe/146096
+    mov rax, rbx
+    sub rax, r8
+    add rax, r9
+    sub rax, r10
+    mov rcx, 365
+    xor edx, edx
+    div rcx                             ; rax = yoe
+    mov r11, rax                        ; yoe
+    ; y = yoe + era*400
+    imul r12, 400
+    add r12, rax                        ; r12 = y (pre-adjust)
+    ; doy = doe - (365*yoe + yoe/4 - yoe/100)
+    mov rax, r11
+    imul rax, 365
+    mov rcx, r11
+    shr rcx, 2
+    add rax, rcx
+    mov rcx, r11
+    xor edx, edx
+    push rax
+    mov rax, rcx
+    mov rcx, 100
+    div rcx
+    mov rcx, rax                        ; yoe/100
+    pop rax
+    sub rax, rcx
+    mov rcx, rbx
+    sub rcx, rax                        ; rcx = doy
+    ; mp = (5*doy+2)/153
+    mov rax, rcx
+    imul rax, 5
+    add rax, 2
+    xor edx, edx
+    mov r8, 153
+    div r8                              ; rax = mp
+    mov r9, rax                         ; mp
+    ; d = doy - (153*mp+2)/5 + 1
+    imul rax, 153
+    add rax, 2
+    xor edx, edx
+    mov r8, 5
+    div r8
+    sub rcx, rax
+    inc rcx
+    mov [cur_mday], ecx
+    ; m = mp + (mp<10 ? 3 : -9)
+    mov rax, r9
+    cmp rax, 10
+    jl  .uc_mlt
+    sub rax, 9
+    jmp .uc_mset
+.uc_mlt:
+    add rax, 3
+.uc_mset:
+    mov [cur_mon], eax
+    ; y += (m<=2)
+    cmp eax, 2
+    jg  .uc_yset
+    inc r12
+.uc_yset:
+    mov [cur_year], r12d
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; update_battery — read /sys BAT0 (fall back BAT1) capacity + status.
+; ============================================================================
+update_battery:
+    push rbx
+    mov byte [bat_present], 0
+    lea rdi, [path_bat0_cap]
+    call read_small_file                ; rax=len or -1, filebuf filled
+    test rax, rax
+    jns .ub_have
+    lea rdi, [path_bat1_cap]
+    call read_small_file
+    test rax, rax
+    js  .ub_done
+    ; using BAT1 → status path 1
+    lea rbx, [path_bat1_stat]
+    jmp .ub_parse
+.ub_have:
+    lea rbx, [path_bat0_stat]
+.ub_parse:
+    mov byte [bat_present], 1
+    ; parse int from filebuf
+    lea rdi, [filebuf]
+    call atoi_buf
+    mov [bat_pct], eax
+    ; status
+    mov rdi, rbx
+    call read_small_file
+    test rax, rax
+    js  .ub_dis
+    mov al, [filebuf]
+    cmp al, 'C'                         ; Charging
+    je  .ub_chg
+    cmp al, 'F'                         ; Full
+    je  .ub_full
+.ub_dis:
+    mov dword [bat_status], 0
+    jmp .ub_done
+.ub_chg:
+    mov dword [bat_status], 1
+    jmp .ub_done
+.ub_full:
+    mov dword [bat_status], 2
+.ub_done:
+    pop rbx
+    ret
+
+; read_small_file — rdi=path. Reads up to 63 bytes into filebuf (NUL-term).
+; Returns rax = bytes read or -1.
+read_small_file:
+    push rbx
+    mov rax, SYS_OPEN
+    xor esi, esi                        ; O_RDONLY
+    xor edx, edx
+    syscall
+    test rax, rax
+    js  .rs_err
+    mov rbx, rax
+    mov rax, SYS_READ
+    mov rdi, rbx
+    lea rsi, [filebuf]
+    mov edx, 63
+    syscall
+    push rax
+    mov rax, SYS_CLOSE
+    mov rdi, rbx
+    syscall
+    pop rax
+    test rax, rax
+    js  .rs_err
+    mov byte [filebuf + rax], 0
+    pop rbx
+    ret
+.rs_err:
+    mov rax, -1
+    pop rbx
+    ret
+
+; parse_tz — rdi = "+HHMM" / "-HHMM" (date +%z). Sets tz_offset_min.
+parse_tz:
+    movzx ecx, byte [rdi]               ; sign
+    cmp cl, '+'
+    je  .pt_body
+    cmp cl, '-'
+    jne .pt_out                         ; malformed → keep default
+.pt_body:
+    movzx eax, byte [rdi + 1]
+    sub eax, '0'
+    imul eax, 10
+    movzx edx, byte [rdi + 2]
+    sub edx, '0'
+    add eax, edx
+    imul eax, 60                        ; hours → minutes
+    movzx edx, byte [rdi + 3]
+    sub edx, '0'
+    imul edx, 10
+    add eax, edx
+    movzx edx, byte [rdi + 4]
+    sub edx, '0'
+    add eax, edx
+    cmp cl, '-'
+    jne .pt_set
+    neg eax
+.pt_set:
+    mov [tz_offset_min], eax
+.pt_out:
+    ret
+
+; atoi_buf — rdi=buf. Parses leading decimal. Returns eax.
+atoi_buf:
+    xor eax, eax
+.ab_loop:
+    movzx edx, byte [rdi]
+    sub edx, '0'
+    cmp edx, 9
+    ja  .ab_done
+    imul eax, eax, 10
+    add eax, edx
+    inc rdi
+    jmp .ab_loop
+.ab_done:
+    ret
+
+; ============================================================================
+; load_wallpaper — read ~/.framebg; sets wallpaper_ok if size==w*h*4.
+; ============================================================================
+load_wallpaper:
+    push rbx
+    push r12
+    mov byte [wallpaper_ok], 0
+    mov rax, SYS_OPEN
+    lea rdi, [path_framebg]
+    xor esi, esi
+    xor edx, edx
+    syscall
+    test rax, rax
+    js  .lw_done
+    mov rbx, rax
+    ; expected size
+    mov r12d, [fb_w]
+    imul r12d, [fb_h]
+    shl r12, 2
+    cmp r12, WALL_MAX
+    ja  .lw_close                       ; buffer too small for this mode
+    ; read loop
+    lea rsi, [wallpaper_buf]
+    xor r8, r8                          ; total
+.lw_read:
+    mov rax, SYS_READ
+    mov rdi, rbx
+    mov rdx, r12
+    sub rdx, r8
+    jz  .lw_fullq
+    syscall
+    test rax, rax
+    jle .lw_fullq
+    add r8, rax
+    add rsi, rax
+    jmp .lw_read
+.lw_fullq:
+    cmp r8, r12
+    jne .lw_close
+    mov byte [wallpaper_ok], 1
+.lw_close:
+    mov rax, SYS_CLOSE
+    mov rdi, rbx
+    syscall
+.lw_done:
+    pop r12
+    pop rbx
+    ret
+
+; ============================================================================
+; DRM — init / reassert / teardown (frame.asm's proven sequences)
+; ============================================================================
+; drm_init — full bring-up: open, SET_MASTER, resources, connector, encoder,
+; CRTC save, CREATE_DUMB, MAP_DUMB, mmap, ADDFB, SETCRTC.
+; Returns rax >= 0 ok, < 0 fail.
+drm_init:
+    push rbx
+    push r12
+    push r13
+    call drm_try_open
+    test rax, rax
+    js  .di_fail
+    mov [drm_fd], rax
+    ; SET_MASTER
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_SET_MASTER
+    xor edx, edx
+    syscall
+    test rax, rax
+    js  .di_close_fail
+    ; resources
+    call drm_get_resources
+    test rax, rax
+    js  .di_close_fail
+    ; first connected connector
+    call drm_find_connector
+    test eax, eax
+    jz  .di_close_fail
+    mov [drm_chosen_conn], r12d
+    ; encoder → CRTC
+    lea rdi, [drm_encoder_buf]
+    xor eax, eax
+    mov ecx, 5
+    rep stosd
+    mov eax, [drm_conn_buf + 44]        ; encoder_id
+    mov [drm_encoder_buf], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_GETENCODER
+    lea rdx, [drm_encoder_buf]
+    syscall
+    test rax, rax
+    js  .di_close_fail
+    mov eax, [drm_encoder_buf + 8]      ; current crtc_id
+    test eax, eax
+    jnz .di_have_crtc
+    mov ecx, [drm_encoder_buf + 12]     ; possible_crtcs bitmask
+    bsf rdx, rcx
+    mov eax, [drm_crtc_ids + rdx*4]
+.di_have_crtc:
+    mov r13d, eax
+    mov [drm_chosen_crtc], eax
+    ; save current CRTC for restore
+    lea rdi, [drm_crtc_save]
+    xor eax, eax
+    mov ecx, 13
+    rep stosq
+    mov [drm_crtc_save + 12], r13d
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_GETCRTC
+    lea rdx, [drm_crtc_save]
+    syscall
+    ; mode dims
+    movzx eax, word [drm_modes_buf + 4] ; hdisplay
+    mov [fb_w], eax
+    movzx eax, word [drm_modes_buf + 14] ; vdisplay
+    mov [fb_h], eax
+    ; CREATE_DUMB
+    lea rdi, [drm_dumb_create]
+    xor eax, eax
+    mov ecx, 4
+    rep stosq
+    mov eax, [fb_w]
+    mov [drm_dumb_create + 4], eax      ; width
+    mov eax, [fb_h]
+    mov [drm_dumb_create + 0], eax      ; height
+    mov dword [drm_dumb_create + 8], 32
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_CREATE_DUMB
+    lea rdx, [drm_dumb_create]
+    syscall
+    test rax, rax
+    js  .di_close_fail
+    mov eax, [drm_dumb_create + 16]
+    mov [drm_dumb_handle], eax
+    mov eax, [drm_dumb_create + 20]
+    mov [drm_dumb_pitch], eax
+    mov [fb_pitch], eax
+    mov rax, [drm_dumb_create + 24]
+    mov [drm_dumb_size], rax
+    mov [fb_size], rax
+    ; MAP_DUMB
+    lea rdi, [drm_dumb_map]
+    xor eax, eax
+    mov ecx, 2
+    rep stosq
+    mov eax, [drm_dumb_handle]
+    mov [drm_dumb_map], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_MAP_DUMB
+    lea rdx, [drm_dumb_map]
+    syscall
+    test rax, rax
+    js  .di_close_fail
+    mov rax, [drm_dumb_map + 8]
+    mov [drm_dumb_offset], rax
+    ; mmap
+    mov rax, SYS_MMAP
+    xor edi, edi
+    mov rsi, [drm_dumb_size]
+    mov edx, PROT_RW
+    mov r10d, MAP_SHARED
+    mov r8, [drm_fd]
+    mov r9, [drm_dumb_offset]
+    syscall
+    cmp rax, -4096
+    ja  .di_close_fail
+    mov [fb_addr], rax
+    ; ADDFB
+    lea rdi, [drm_fb_cmd]
+    xor eax, eax
+    mov ecx, 7
+    rep stosd
+    mov eax, [fb_w]
+    mov [drm_fb_cmd + 4], eax
+    mov eax, [fb_h]
+    mov [drm_fb_cmd + 8], eax
+    mov eax, [drm_dumb_pitch]
+    mov [drm_fb_cmd + 12], eax
+    mov dword [drm_fb_cmd + 16], 32
+    mov dword [drm_fb_cmd + 20], 24
+    mov eax, [drm_dumb_handle]
+    mov [drm_fb_cmd + 24], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_ADDFB
+    lea rdx, [drm_fb_cmd]
+    syscall
+    test rax, rax
+    js  .di_close_fail
+    mov eax, [drm_fb_cmd]
+    mov [drm_fb_id], eax
+    ; SETCRTC
+    call drm_reassert
+    test rax, rax
+    js  .di_close_fail
+    xor eax, eax
+    jmp .di_out
+.di_close_fail:
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_DROP_MASTER
+    xor edx, edx
+    syscall
+    mov rax, SYS_CLOSE
+    mov rdi, [drm_fd]
+    syscall
+.di_fail:
+    mov rax, -1
+.di_out:
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; drm_check_reassert — read-only GETCRTC; if the CRTC's fb is no longer ours
+; (VT switch let fbcon take the display), SETCRTC it back. Zero modeset work
+; in the common case — just one read ioctl per redraw.
+drm_check_reassert:
+    lea rdi, [drm_crtc_probe]
+    xor eax, eax
+    mov ecx, 13
+    rep stosq
+    mov eax, [drm_chosen_crtc]
+    mov [drm_crtc_probe + 12], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_GETCRTC
+    lea rdx, [drm_crtc_probe]
+    syscall
+    test rax, rax
+    js  .cr_out                         ; probe failed → leave it alone
+    mov eax, [drm_crtc_probe + 16]      ; current fb_id
+    cmp eax, [drm_fb_id]
+    je  .cr_out
+    call drm_reassert
+.cr_out:
+    ret
+
+; drm_reassert — SETCRTC our fb (used at init and after suspend/resume).
+drm_reassert:
+    mov eax, [drm_chosen_conn]
+    mov [drm_set_conn_id], eax
+    lea rdi, [drm_crtc_set]
+    xor eax, eax
+    mov ecx, 13
+    rep stosq
+    lea rax, [drm_set_conn_id]
+    mov [drm_crtc_set + 0], rax
+    mov dword [drm_crtc_set + 8], 1
+    mov eax, [drm_chosen_crtc]
+    mov [drm_crtc_set + 12], eax
+    mov eax, [drm_fb_id]
+    mov [drm_crtc_set + 16], eax
+    mov dword [drm_crtc_set + 32], 1    ; mode_valid
+    lea rsi, [drm_modes_buf]
+    lea rdi, [drm_crtc_set + 36]
+    mov ecx, 17
+    rep movsd
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_SETCRTC
+    lea rdx, [drm_crtc_set]
+    syscall
+    ret
+
+; drm_teardown — restore CRTC, RMFB, munmap, DESTROY_DUMB, DROP_MASTER, close.
+drm_teardown:
+    ; restore original CRTC
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_SETCRTC
+    lea rdx, [drm_crtc_save]
+    syscall
+    ; RMFB
+    mov eax, [drm_fb_id]
+    mov [drm_dumb_destroy], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_RMFB
+    lea rdx, [drm_dumb_destroy]
+    syscall
+    ; munmap
+    mov rax, SYS_MUNMAP
+    mov rdi, [fb_addr]
+    mov rsi, [drm_dumb_size]
+    syscall
+    ; DESTROY_DUMB
+    mov eax, [drm_dumb_handle]
+    mov [drm_dumb_destroy], eax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_DESTROY_DUMB
+    lea rdx, [drm_dumb_destroy]
+    syscall
+    ; DROP_MASTER + close
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_DROP_MASTER
+    xor edx, edx
+    syscall
+    mov rax, SYS_CLOSE
+    mov rdi, [drm_fd]
+    syscall
+    ret
+
+; drm_try_open — /dev/dri/card0..9, first that opens. rax = fd or -1.
+drm_try_open:
+    push rbx
+    xor ebx, ebx
+.dt_loop:
+    cmp ebx, 10
+    jge .dt_miss
+    lea rdi, [drm_card_path]
+    mov dword [rdi], '/dev'
+    mov dword [rdi+4], '/dri'
+    mov dword [rdi+8], '/car'
+    mov byte [rdi+12], 'd'
+    mov eax, ebx
+    add al, '0'
+    mov [rdi+13], al
+    mov byte [rdi+14], 0
+    mov rax, SYS_OPEN
+    mov esi, O_RDWR
+    xor edx, edx
+    syscall
+    test rax, rax
+    jns .dt_ok
+    inc ebx
+    jmp .dt_loop
+.dt_ok:
+    pop rbx
+    ret
+.dt_miss:
+    mov rax, -1
+    pop rbx
+    ret
+
+; drm_get_resources — GETRESOURCES twice (counts then arrays). rax=0/-1.
+drm_get_resources:
+    lea rdi, [drm_res_buf]
+    xor eax, eax
+    mov ecx, 8
+    rep stosq
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_GETRESOURCES
+    lea rdx, [drm_res_buf]
+    syscall
+    test rax, rax
+    js  .dg_err
+    ; cap + point arrays
+    mov eax, [drm_res_buf + 32]
+    cmp eax, DRM_MAX_IDS
+    jbe .dg_fb
+    mov eax, DRM_MAX_IDS
+.dg_fb:
+    mov [drm_res_buf + 32], eax
+    lea rax, [drm_fb_ids]
+    mov [drm_res_buf + 0], rax
+    mov eax, [drm_res_buf + 36]
+    cmp eax, DRM_MAX_IDS
+    jbe .dg_c
+    mov eax, DRM_MAX_IDS
+.dg_c:
+    mov [drm_res_buf + 36], eax
+    lea rax, [drm_crtc_ids]
+    mov [drm_res_buf + 8], rax
+    mov eax, [drm_res_buf + 40]
+    cmp eax, DRM_MAX_IDS
+    jbe .dg_n
+    mov eax, DRM_MAX_IDS
+.dg_n:
+    mov [drm_res_buf + 40], eax
+    lea rax, [drm_conn_ids]
+    mov [drm_res_buf + 16], rax
+    mov eax, [drm_res_buf + 44]
+    cmp eax, DRM_MAX_IDS
+    jbe .dg_e
+    mov eax, DRM_MAX_IDS
+.dg_e:
+    mov [drm_res_buf + 44], eax
+    lea rax, [drm_enc_ids]
+    mov [drm_res_buf + 24], rax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_GETRESOURCES
+    lea rdx, [drm_res_buf]
+    syscall
+    test rax, rax
+    js  .dg_err
+    xor eax, eax
+    ret
+.dg_err:
+    mov rax, -1
+    ret
+
+; drm_find_connector — first connected with modes. rax=1 found (r12d = id,
+; drm_conn_buf + drm_modes_buf[0] valid), rax=0 none.
+drm_find_connector:
+    push rbx
+    push r13
+    mov r13d, [drm_res_buf + 40]
+    xor ebx, ebx
+.df_loop:
+    cmp ebx, r13d
+    jge .df_none
+    mov eax, [drm_conn_ids + rbx*4]
+    mov r12d, eax
+    lea rdi, [drm_conn_buf]
+    xor eax, eax
+    mov ecx, 10
+    rep stosq
+    mov [drm_conn_buf + 32], dword DRM_MAX_MODES
+    mov [drm_conn_buf + 36], dword DRM_MAX_PROPS
+    mov [drm_conn_buf + 40], dword DRM_MAX_IDS
+    mov [drm_conn_buf + 48], r12d
+    lea rax, [drm_enc_arr]
+    mov [drm_conn_buf + 0], rax
+    lea rax, [drm_modes_buf]
+    mov [drm_conn_buf + 8], rax
+    lea rax, [drm_props_arr]
+    mov [drm_conn_buf + 16], rax
+    lea rax, [drm_propvals_arr]
+    mov [drm_conn_buf + 24], rax
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_MODE_GETCONNECTOR
+    lea rdx, [drm_conn_buf]
+    syscall
+    test rax, rax
+    js  .df_skip
+    mov eax, [drm_conn_buf + 60]
+    cmp eax, DRM_MODE_CONNECTED
+    jne .df_skip
+    mov eax, [drm_conn_buf + 32]
+    test eax, eax
+    jz  .df_skip
+    mov eax, 1
+    pop r13
+    pop rbx
+    ret
+.df_skip:
+    inc ebx
+    jmp .df_loop
+.df_none:
+    xor eax, eax
+    pop r13
+    pop rbx
+    ret
+
+; ============================================================================
+; fbtest — anon 1920x1200 buffer instead of DRM; dump raw for PNG conversion.
+; ============================================================================
+fbtest_init:
+    mov dword [fb_w], 1920
+    mov dword [fb_h], 1200
+    mov dword [fb_pitch], 1920*4
+    mov qword [fb_size], 1920*1200*4
+    mov rax, SYS_MMAP
+    xor edi, edi
+    mov rsi, [fb_size]
+    mov edx, PROT_RW
+    mov r10d, MAP_PRIVATE | MAP_ANONYMOUS
+    mov r8, -1
+    xor r9d, r9d
+    syscall
+    mov [fb_addr], rax
+    ret
+
+fbtest_dump:
+    push rbx
+    mov rax, SYS_OPEN
+    lea rdi, [path_fbtest_out]
+    mov esi, O_WRONLY | O_CREAT | O_TRUNC
+    mov edx, 0o644
+    syscall
+    test rax, rax
+    js  .fd_done
+    mov rbx, rax
+    mov rax, SYS_WRITE
+    mov rdi, rbx
+    mov rsi, [fb_addr]
+    mov rdx, [fb_size]
+    syscall
+    mov rax, SYS_CLOSE
+    mov rdi, rbx
+    syscall
+.fd_done:
+    pop rbx
+    ret
+
+; ============================================================================
+; small helpers
+; ============================================================================
+; streq_cstr — rdi, rsi NUL-terminated. ZF=1 if equal.
+streq_cstr:
+    mov al, [rdi]
+    mov cl, [rsi]
+    cmp al, cl
+    jne .sq_ne
+    test al, al
+    jz  .sq_eq
+    inc rdi
+    inc rsi
+    jmp streq_cstr
+.sq_eq:
+    xor eax, eax                        ; sets ZF
+    ret
+.sq_ne:
+    or eax, 1                           ; clears ZF
+    ret
+
+; u32_to_ascii — eax = number, rdi = dest. Writes decimal, returns rdi past.
+u32_to_ascii:
+    push rbx
+    push r12
+    lea rbx, [rsp - 40]                 ; red-zone scratch
+    lea r12, [rbx + 20]                 ; write backwards from here
+    mov byte [r12], 0
+    mov ecx, 10
+    test eax, eax
+    jnz .ua_loop
+    dec r12
+    mov byte [r12], '0'
+    jmp .ua_copy
+.ua_loop:
+    xor edx, edx
+    div ecx
+    dec r12
+    add dl, '0'
+    mov [r12], dl
+    test eax, eax
+    jnz .ua_loop
+.ua_copy:
+    mov al, [r12]
+    test al, al
+    jz  .ua_done
+    mov [rdi], al
+    inc rdi
+    inc r12
+    jmp .ua_copy
+.ua_done:
+    pop r12
+    pop rbx
+    ret
+
+; write_stderr — rsi = buf, rdx = len.
+write_stderr:
+    mov rax, SYS_WRITE
+    mov edi, 2
+    syscall
+    ret

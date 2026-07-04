@@ -1,0 +1,56 @@
+#!/bin/bash
+# greet-session <1|2|3> — launched by bolt-greet (as root, DRM released).
+#   1 = tile on frame     (frame is the X server, root; session as user)
+#   2 = tile on X         (Xorg as root; session as user — the gdm split)
+#   3 = i3 on X           (safeguard)
+# Returns when the session ends; bolt-greet then redraws its menu.
+set -u
+CH="${1:-1}"
+
+# The user the session runs as. Single-user machine; keep it simple.
+U=geir
+UHOME=/home/geir
+UID_N=1000
+
+if [ "$CH" = "1" ]; then
+    # frame brings its own DRM + input handling; the script starts tile and
+    # the full ~/.tilerc autostart as $U. GREETER=1 = non-interactive exit
+    # (no "restart gdm?" prompt — control returns to bolt-greet instead).
+    GREETER=1 exec bash "$UHOME/Main/G/GIT-isene/frame/test/desktop-on-frame.sh"
+fi
+
+# --- X sessions: root Xorg + user session, same privileged/unprivileged
+# --- split as frame (and as gdm). Auth via a throwaway xauth cookie.
+VT="vt$(fgconsole 2>/dev/null || echo 1)"
+XAUTH=/run/bolt-greet.xauth
+rm -f "$XAUTH" /tmp/.X11-unix/X0
+touch "$XAUTH"; chown "$U:$U" "$XAUTH"
+runuser -u "$U" -- xauth -f "$XAUTH" add :0 MIT-MAGIC-COOKIE-1 "$(mcookie)" \
+    2>/dev/null
+
+/usr/lib/xorg/Xorg :0 "$VT" -auth "$XAUTH" -keeptty -noreset \
+    > /tmp/bolt-greet-xorg.log 2>&1 &
+XPID=$!
+for _ in $(seq 1 50); do [ -e /tmp/.X11-unix/X0 ] && break; sleep 0.1; done
+kill -0 "$XPID" 2>/dev/null || { echo "greet-session: Xorg died" >&2; exit 1; }
+
+if [ "$CH" = "3" ]; then
+    # i3 safeguard: run the same X prologue (keyboard layout, xmodmap,
+    # daemons) so the fallback session is fully usable, then i3.
+    SESSION=(bash -c ". $UHOME/bin/xps14; exec /usr/bin/i3")
+else
+    SESSION=("$UHOME/bin/start-tile-session")
+fi
+
+runuser -u "$U" -- env \
+    DISPLAY=:0 XAUTHORITY="$XAUTH" \
+    HOME="$UHOME" USER="$U" LOGNAME="$U" SHELL=/bin/bash \
+    XDG_RUNTIME_DIR="/run/user/$UID_N" \
+    DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$UID_N/bus" \
+    LANG=en_US.UTF-8 XDG_SESSION_TYPE=x11 \
+    "${SESSION[@]}"
+
+# Session ended (WM exited / logout). Take X down; kill by spawned PID only.
+kill "$XPID" 2>/dev/null
+wait "$XPID" 2>/dev/null
+exit 0
