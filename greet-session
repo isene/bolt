@@ -12,6 +12,8 @@ U=geir
 UHOME=/home/geir
 UID_N=1000
 
+ts(){ echo "greet-session: $* [$(date +%T)]" >&2; }
+
 if [ "$CH" = "1" ]; then
     # frame brings its own DRM + input handling; the script starts tile and
     # the full ~/.tilerc autostart as $U. GREETER=1 = non-interactive exit
@@ -28,11 +30,13 @@ touch "$XAUTH"; chown "$U:$U" "$XAUTH"
 runuser -u "$U" -- xauth -f "$XAUTH" add :0 MIT-MAGIC-COOKIE-1 "$(mcookie)" \
     2>/dev/null
 
+ts "starting Xorg on $VT"
 /usr/lib/xorg/Xorg :0 "$VT" -auth "$XAUTH" -keeptty -noreset \
     > /tmp/bolt-greet-xorg.log 2>&1 &
 XPID=$!
 for _ in $(seq 1 50); do [ -e /tmp/.X11-unix/X0 ] && break; sleep 0.1; done
 kill -0 "$XPID" 2>/dev/null || { echo "greet-session: Xorg died" >&2; exit 1; }
+ts "Xorg up"
 
 if [ "$CH" = "3" ]; then
     # i3 safeguard: its own config execs ~/bin/xps14 (the X prologue), so
@@ -42,15 +46,37 @@ else
     SESSION=("$UHOME/bin/start-tile-session")
 fi
 
-runuser -u "$U" -- env \
+# setsid: the session gets its own process group so we can kill EVERYTHING
+# it spawned when it ends. Without this, ~/.tilerc children (strip-watchdog,
+# firefox, glass, ...) outlive the session as orphans — a leftover
+# strip-watchdog respawning strip 1x/s fought the next session's bar/tray.
+# MOZ_DISABLE_CONTENT_SANDBOX: apparmor denies userns to a root/runuser-
+# launched Firefox (unshare EPERM → content children die); same tradeoff as
+# the frame session. XDG_DATA_DIRS: glib needs it for GSettings schemas —
+# without it nm-applet crashes at startup (no NM tray icon).
+ts "starting session ($CH)"
+setsid runuser -u "$U" -- env \
     DISPLAY=:0 XAUTHORITY="$XAUTH" \
     HOME="$UHOME" USER="$U" LOGNAME="$U" SHELL=/bin/bash \
     XDG_RUNTIME_DIR="/run/user/$UID_N" \
     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$UID_N/bus" \
+    XDG_DATA_DIRS="/usr/local/share:/usr/share" \
     LANG=en_US.UTF-8 XDG_SESSION_TYPE=x11 \
-    "${SESSION[@]}"
+    MOZ_DISABLE_CONTENT_SANDBOX=1 \
+    "${SESSION[@]}" &
+SPID=$!
+wait "$SPID"
+ts "session ended"
 
-# Session ended (WM exited / logout). Take X down; kill by spawned PID only.
+# Session over: kill its whole process group (exact pgid — never by name),
+# then X. TERM first, KILL after a grace period for stragglers.
+kill -TERM -- "-$SPID" 2>/dev/null
+for _ in $(seq 1 20); do
+    pgrep -g "$SPID" >/dev/null 2>&1 || break
+    sleep 0.1
+done
+kill -KILL -- "-$SPID" 2>/dev/null
 kill "$XPID" 2>/dev/null
 wait "$XPID" 2>/dev/null
+ts "cleaned up"
 exit 0

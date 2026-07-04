@@ -84,12 +84,6 @@
 %define KEY_3       4
 %define KEY_P       25
 %define KEY_S       31
-%define KEY_J       36
-%define KEY_K       37
-%define KEY_ENTER   28
-%define KEY_KPENTER 96
-%define KEY_UP      103
-%define KEY_DOWN    108
 
 ; ---- layout / colours (memory dwords are X,R,G,B little-endian = B,G,R,X) --
 ; Strip-like top info bar + session selector across the bottom; the
@@ -188,7 +182,6 @@ str_nl:         db 10, 0
 section .bss
     align 8
 fbtest_mode:    resb 1
-sel:            resd 1                  ; selected row 0..2
 tz_offset_min:  resd 1                  ; local-time offset, minutes east of UTC
 
 fb_addr:        resq 1                  ; render target = db_addr[back_idx]
@@ -300,7 +293,6 @@ _start:
     inc r12
     jmp .arg_loop
 .arg_done:
-    mov dword [sel], 0
 
     lea rsi, [log_start]
     mov rdx, log_start_len
@@ -408,7 +400,9 @@ greeter_loop:
     cmp eax, 11
     je  .gl_poweroff
     ; launch session eax(1..3): teardown DRM + input, run, re-init
+    mov ebx, eax                        ; close_input clobbers eax/edi
     call close_input
+    mov edi, ebx
     call launch_session
     call drm_init
     test rax, rax
@@ -441,23 +435,24 @@ greeter_loop:
     ret
 
 ; ============================================================================
-; launch_session — [sel] chosen (0..2). Release DRM, exec greet-session <n>,
+; launch_session — edi = choice (1..3). Release DRM, run greet-session <n>,
 ; wait for it. Caller re-inits DRM after.
 ; ============================================================================
 launch_session:
     push rbx
+    push r12
+    mov r12d, edi                       ; choice 1..3
     lea rsi, [log_launch]
     mov rdx, log_launch_len
     call write_stderr
     lea rax, [arg_gs0]
     mov [gs_argv], rax
-    mov eax, [sel]
     lea rcx, [gs_choice1]
-    cmp eax, 1
-    jne .ls_c2q
+    cmp r12d, 2
+    jne .ls_c3q
     lea rcx, [gs_choice2]
-.ls_c2q:
-    cmp eax, 2
+.ls_c3q:
+    cmp r12d, 3
     jne .ls_set
     lea rcx, [gs_choice3]
 .ls_set:
@@ -467,6 +462,7 @@ launch_session:
     lea rdi, [path_greetsess]
     lea rsi, [gs_argv]
     call run_child_wait
+    pop r12
     pop rbx
     ret
 
@@ -676,65 +672,32 @@ drain_input:
     ret
 
 ; ============================================================================
-; handle_key — edx = keycode. Nav updates [sel] (returns 0 → redraw);
-; returns 1..3 launch, 10 suspend, 11 poweroff.
+; handle_key — edx = keycode. 1/2/3 launch directly; s suspend, p poweroff,
+; Esc exit. Returns 0 (ignore), 1..3, 10, 11, 20.
 ; ============================================================================
 handle_key:
     cmp edx, KEY_ESC
     je  .hk_esc
-    cmp edx, KEY_UP
-    je  .hk_up
-    cmp edx, KEY_K
-    je  .hk_up
-    cmp edx, KEY_DOWN
-    je  .hk_down
-    cmp edx, KEY_J
-    je  .hk_down
     cmp edx, KEY_1
     je  .hk_s1
     cmp edx, KEY_2
     je  .hk_s2
     cmp edx, KEY_3
     je  .hk_s3
-    cmp edx, KEY_ENTER
-    je  .hk_enter
-    cmp edx, KEY_KPENTER
-    je  .hk_enter
     cmp edx, KEY_S
     je  .hk_suspend
     cmp edx, KEY_P
     je  .hk_power
     xor eax, eax
     ret
-.hk_up:
-    mov eax, [sel]
-    add eax, 2
-    jmp .hk_mod3
-.hk_down:
-    mov eax, [sel]
-    inc eax
-.hk_mod3:
-    xor edx, edx
-    mov ecx, 3
-    div ecx
-    mov [sel], edx
-    xor eax, eax
-    ret
 .hk_s1:
-    mov dword [sel], 0
     mov eax, 1
     ret
 .hk_s2:
-    mov dword [sel], 1
     mov eax, 2
     ret
 .hk_s3:
-    mov dword [sel], 2
     mov eax, 3
-    ret
-.hk_enter:
-    mov eax, [sel]
-    inc eax
     ret
 .hk_suspend:
     mov eax, 10
@@ -823,34 +786,12 @@ render_frame:
     jne .rf_lbl_ok
     lea r13, [str_row2]
 .rf_lbl_ok:
-    cmp r14d, [sel]
-    jne .rf_no_hl
-    ; accent box behind the selected entry
-    mov rdi, r13
-    call cstr_len
-    shl eax, 4                          ; text width
-    add eax, 32                         ; + padding
-    mov ecx, eax
-    shr ecx, 1
-    mov edi, r15d
-    sub edi, ecx
-    mov esi, [fb_h]
-    sub esi, BOTBAR_H - 8
-    mov edx, eax
-    mov ecx, 48
-    mov r8d, COL_ACCENT
-    call fill_rect
-.rf_no_hl:
     mov edi, r15d
     mov esi, [fb_h]
     sub esi, BOTBAR_H - 16
     mov rdx, r13
     mov ecx, 2
     mov r8d, COL_TEXT
-    cmp r14d, [sel]
-    jne .rf_col_ok
-    mov r8d, COL_SELTEXT
-.rf_col_ok:
     call draw_cstr_centered
     inc r14d
     jmp .rf_row
