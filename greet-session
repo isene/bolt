@@ -19,6 +19,37 @@ ts(){ echo "greet-session: $* [$(date +%T)]" >&2; }
 # session inherit / as their working directory (bare's prompt showed /).
 cd "$UHOME" 2>/dev/null || true
 
+# Stray sweep on EVERY session start. bolt-greet loops back to its menu
+# internally after a session ends, so bolt-greet-run's boot-time sweep never
+# covers session→session transitions. Anything still carrying GREET_SESSION=1
+# now — outside this process chain — is a leftover from the previous session
+# (a strip-watchdog kept respawning strip against the dead display, then
+# adopted the NEXT session: duplicate strips, snixembed watcher-name fights,
+# lost tray). Kill by exact PID, TERM then KILL.
+anc=" $$ "
+p=$PPID
+while [ -n "$p" ] && [ "$p" != "0" ]; do
+    anc="$anc$p "
+    stat=$(< "/proc/$p/stat") || break
+    stat=${stat##*) }                 # strip "pid (comm) " — comm may hold spaces
+    set -- $stat
+    p=$2                              # ppid
+done
+for pass in TERM KILL; do
+    found=0
+    for d in /proc/[0-9]*/environ; do
+        pid=${d%/environ}; pid=${pid#/proc/}
+        case "$anc" in *" $pid "*) continue;; esac
+        if grep -qzs 'GREET_SESSION=1' "$d" 2>/dev/null; then
+            found=1
+            [ "$pass" = TERM ] && ts "killing stray $pid ($(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | head -c 50))"
+            kill -$pass "$pid" 2>/dev/null
+        fi
+    done
+    [ "$found" = 0 ] && break
+    [ "$pass" = TERM ] && sleep 0.4
+done
+
 if [ "$CH" = "1" ]; then
     # frame brings its own DRM + input handling; the script starts tile and
     # the full ~/.tilerc autostart as $U. GREETER=1 = non-interactive exit
