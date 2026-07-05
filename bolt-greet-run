@@ -19,11 +19,15 @@ fi
 # The kernel allows same-uid DRM master takeover, so a running Xorg/frame
 # does NOT protect itself against us — starting the greeter over a live
 # session steals the panel mid-use. Refuse unless the display is free.
-if [ -n "$(ls /tmp/.X11-unix/ 2>/dev/null)" ] && [ "${GREET_FORCE:-0}" != "1" ]; then
-    echo "bolt-greet-run: a display server is running (sockets in /tmp/.X11-unix)." >&2
+# LIVE check via ss (listening sockets), not ls: a crashed/killed server
+# leaves its socket FILE behind, and a dead file must not block the
+# greeter. Stale files are cleaned so the session's own X can bind :0.
+if ss -xl 2>/dev/null | grep -q '/tmp/\.X11-unix/' && [ "${GREET_FORCE:-0}" != "1" ]; then
+    echo "bolt-greet-run: a display server is running (live socket in /tmp/.X11-unix)." >&2
     echo "bolt-greet-run: stop it first (sudo systemctl stop gdm3), or GREET_FORCE=1 to override." >&2
     exit 1
 fi
+rm -f /tmp/.X11-unix/X* 2>/dev/null
 
 # Stray sweep: everything a greeter tree ever spawns carries GREET_SESSION=1
 # (the wrapper exports it below; bolt-greet passes it to sessions). With no
