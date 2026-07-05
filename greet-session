@@ -14,6 +14,11 @@ UID_N=1000
 
 ts(){ echo "greet-session: $* [$(date +%T)]" >&2; }
 
+# Sessions start in the user's home, like a display manager would. The
+# greeter chain's cwd is / (systemd unit); without this, terminals in the
+# session inherit / as their working directory (bare's prompt showed /).
+cd "$UHOME" 2>/dev/null || true
+
 if [ "$CH" = "1" ]; then
     # frame brings its own DRM + input handling; the script starts tile and
     # the full ~/.tilerc autostart as $U. GREETER=1 = non-interactive exit
