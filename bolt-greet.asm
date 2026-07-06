@@ -375,6 +375,21 @@ _start:
     call install_exit_handler
     mov edi, 1                          ; SIGHUP
     call install_exit_handler
+    ; SIGPIPE → SIG_IGN: stderr goes through bolt-greet-run's log tee; if
+    ; that tee dies (a sweep bug once killed it), the next write must
+    ; return EPIPE, not TERMINATE the greeter mid-session (same lesson as
+    ; frame v0.0.81).
+    lea rdi, [sig_sa_buf]
+    mov qword [rdi + 0], 1              ; SIG_IGN
+    mov qword [rdi + 8], 0              ; no flags (no restorer needed)
+    mov qword [rdi + 16], 0
+    mov qword [rdi + 24], 0
+    mov rax, SYS_RT_SIGACTION
+    mov edi, 13                         ; SIGPIPE
+    lea rsi, [sig_sa_buf]
+    xor edx, edx
+    mov r10, 8
+    syscall
 
     cmp byte [fbtest_mode], 0
     jne .fbtest_path

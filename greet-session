@@ -26,21 +26,38 @@ cd "$UHOME" 2>/dev/null || true
 # (a strip-watchdog kept respawning strip against the dead display, then
 # adopted the NEXT session: duplicate strips, snixembed watcher-name fights,
 # lost tray). Kill by exact PID, TERM then KILL.
+# Protected set: this chain's ancestors BELOW pid 1. A candidate whose
+# ancestor walk reaches any of these is part of the LIVE greeter tree —
+# including SIBLINGS like bolt-greet-run's log tee (child of the wrapper,
+# not of this chain). Killing that tee SIGPIPEd the greeter mid-session
+# and systemd's restart loop spammed the console. True strays were
+# reparented to pid 1 and never touch the live chain.
 anc=" $$ "
 p=$PPID
-while [ -n "$p" ] && [ "$p" != "0" ]; do
+while [ -n "$p" ] && [ "$p" != "0" ] && [ "$p" != "1" ]; do
     anc="$anc$p "
     stat=$(< "/proc/$p/stat") || break
     stat=${stat##*) }                 # strip "pid (comm) " — comm may hold spaces
     set -- $stat
     p=$2                              # ppid
 done
+in_live_tree() {
+    local p=$1 stat
+    while [ -n "$p" ] && [ "$p" != "0" ] && [ "$p" != "1" ]; do
+        case "$anc" in *" $p "*) return 0;; esac
+        stat=$(< "/proc/$p/stat") || return 1
+        stat=${stat##*) }
+        set -- $stat
+        p=$2
+    done
+    return 1
+}
 for pass in TERM KILL; do
     found=0
     for d in /proc/[0-9]*/environ; do
         pid=${d%/environ}; pid=${pid#/proc/}
-        case "$anc" in *" $pid "*) continue;; esac
         if grep -qzs 'GREET_SESSION=1' "$d" 2>/dev/null; then
+            in_live_tree "$pid" && continue
             found=1
             [ "$pass" = TERM ] && ts "killing stray $pid ($(tr '\0' ' ' < /proc/$pid/cmdline 2>/dev/null | head -c 50))"
             kill -$pass "$pid" 2>/dev/null
