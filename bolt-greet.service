@@ -14,6 +14,10 @@ TTYReset=yes
 TTYVHangup=yes
 Restart=on-failure
 RestartSec=1
+# Clean exit (Esc) must not strand TTY1 as a dead console: hand it to a
+# login getty instead. Conflicts= above stops the getty again whenever
+# the greeter is started back up (sudo systemctl start bolt-greet).
+ExecStopPost=/bin/sh -c '[ "$EXIT_STATUS" = 0 ] && systemctl --no-block start getty@tty1.service || true'
 [Install]
 Alias=display-manager.service
 WantedBy=graphical.target
