@@ -136,10 +136,11 @@ fi
 # it spawned when it ends. Without this, ~/.tilerc children (strip-watchdog,
 # firefox, glass, ...) outlive the session as orphans — a leftover
 # strip-watchdog respawning strip 1x/s fought the next session's bar/tray.
-# MOZ_DISABLE_CONTENT_SANDBOX: apparmor denies userns to a root/runuser-
-# launched Firefox (unshare EPERM → content children die); same tradeoff as
-# the frame session. XDG_DATA_DIRS: glib needs it for GSettings schemas —
-# without it nm-applet crashes at startup (no NM tray icon).
+# XDG_DATA_DIRS: glib needs it for GSettings schemas — without it
+# nm-applet crashes at startup (no NM tray icon).
+# (MOZ_DISABLE_CONTENT_SANDBOX was exported here until 2026-07: Firefox 150
+# tolerates the userns EPERM — 16 content processes verified alive with the
+# sandbox on — and the var caused the "security sandbox is disabled" bar.)
 ts "starting session ($CH)"
 setsid runuser -u "$U" -- env \
     DISPLAY=:0 XAUTHORITY="$XAUTH" \
@@ -148,7 +149,6 @@ setsid runuser -u "$U" -- env \
     DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$UID_N/bus" \
     XDG_DATA_DIRS="/usr/local/share:/usr/share" \
     LANG=en_US.UTF-8 XDG_SESSION_TYPE=x11 \
-    MOZ_DISABLE_CONTENT_SANDBOX=1 \
     "${SESSION[@]}" &
 SPID=$!
 wait "$SPID"
