@@ -40,9 +40,6 @@
 %define SYS_FCNTL         72
 %define VT_ACTIVATE       0x5606
 %define VT_WAITACTIVE     0x5607
-%define KDSETMODE         0x4B3A
-%define KD_TEXT           0
-%define KD_GRAPHICS       1
 %define SYS_RT_SIGRETURN  15
 %define SA_RESTORER       0x04000000
 %define SYS_TIME          201
@@ -281,7 +278,6 @@ own_vt:         resd 1                  ; --vt N; 0 = VT gating disabled
 vt_fd:          resd 1                  ; /sys/class/tty/tty0/active (or -1)
 vt_active:      resb 1                  ; 1 = our VT is foreground
 vtbuf:          resb 16
-kd_tty_path:    resb 16                 ; "/dev/tty<N>" built by vt_set_kd
     alignb 8
 flip_cmd:       resb 24                 ; struct drm_mode_crtc_page_flip
 drm_pollfd:     resb 8                  ; wait_flip's single pollfd
@@ -386,8 +382,6 @@ _start:
     call drm_init
     test rax, rax
     js  .drm_fail
-    mov edi, KD_GRAPHICS                ; park fbcon (see vt_set_kd)
-    call vt_set_kd
     call load_wallpaper
     cmp byte [wallpaper_ok], 0
     je  .st_wall_no
@@ -405,8 +399,6 @@ _start:
     mov rdx, log_esc_len
     call write_stderr
     call drm_teardown
-    mov edi, KD_TEXT
-    call vt_set_kd
     mov rax, SYS_EXIT
     xor edi, edi
     syscall
@@ -483,17 +475,21 @@ greeter_loop:
     je  .gl_suspend
     cmp eax, 11
     je  .gl_poweroff
-    ; launch session eax(1..3): teardown DRM + input, run, re-init
+    ; launch session eax(1..3): drop the device, run, re-take
     mov ebx, eax                        ; close_input clobbers eax/edi
     call close_input
     mov edi, ebx
     call launch_session
-    call drm_init
+    ; Session over. Re-take the device — no full drm_init: the BOs, mode
+    ; and wallpaper survive, and the next present re-binds via SETCRTC.
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_SET_MASTER
+    xor edx, edx
+    syscall
     test rax, rax
-    js  .gl_exit
-    mov edi, KD_GRAPHICS                ; Xorg sessions restore KD_TEXT on exit
-    call vt_set_kd
-    call load_wallpaper
+    js  .gl_exit                        ; GPU owned elsewhere → bail out
+    mov byte [crtc_bound], 0            ; next present = SETCRTC
     call init_input
     xor ebx, ebx
     jmp .gl_iter
@@ -544,7 +540,18 @@ launch_session:
 .ls_set:
     mov [gs_argv + 8], rcx
     mov qword [gs_argv + 16], 0
-    call drm_teardown
+    ; Drop DRM master WITHOUT restoring the console CRTC: the panel keeps
+    ; showing the greeter's last frame until the session's server modesets,
+    ; so no console text (nor the echoed menu digit) flashes through. The
+    ; full teardown (console restore) still runs on Esc / quit / signals.
+    ; NEVER park the VT in KD_GRAPHICS instead: with VT_AUTO the kernel
+    ; refuses to switch away from a graphics console, which froze every
+    ; Ctrl+Alt+Fn in the session (v0.1.11, reverted).
+    mov rax, SYS_IOCTL
+    mov rdi, [drm_fd]
+    mov esi, DRM_IOCTL_DROP_MASTER
+    xor edx, edx
+    syscall
     lea rdi, [path_greetsess]
     lea rsi, [gs_argv]
     call run_child_wait
@@ -1745,55 +1752,6 @@ vt_claim:
 .vcl_out:
     ret
 
-; vt_set_kd — edi = KD_TEXT / KD_GRAPHICS on our own VT (/dev/tty<own_vt>;
-; own_vt 0 → /dev/tty0 = current console). fbcon repaints the console the
-; moment the greeter drops DRM master (session hand-off), flashing stale
-; TTY text plus the echoed menu digit onto the panel. Graphics mode parks
-; fbcon for the greeter's whole life, sessions included; Esc / signal
-; exits restore text mode. Async-signal-safe (raw syscalls only).
-vt_set_kd:
-    push rbx
-    mov ebx, edi                        ; mode
-    mov rax, '/dev/tty'                 ; 8 bytes exactly
-    mov [kd_tty_path], rax
-    mov eax, [own_vt]
-    lea rdi, [kd_tty_path + 8]
-    cmp eax, 9
-    jle .vsk_1dig
-    mov ecx, 10                         ; two digits (VT 10..63)
-    xor edx, edx
-    div ecx                             ; eax = tens, edx = ones
-    add eax, '0'
-    mov [rdi], al
-    add edx, '0'
-    mov [rdi + 1], dl
-    mov byte [rdi + 2], 0
-    jmp .vsk_open
-.vsk_1dig:
-    add eax, '0'
-    mov [rdi], al
-    mov byte [rdi + 1], 0
-.vsk_open:
-    mov rax, SYS_OPEN
-    lea rdi, [kd_tty_path]
-    mov esi, O_RDWR
-    xor edx, edx
-    syscall
-    test rax, rax
-    js  .vsk_out
-    push rax
-    mov rdi, rax
-    mov rax, SYS_IOCTL
-    mov esi, KDSETMODE
-    mov edx, ebx
-    syscall
-    pop rdi
-    mov rax, SYS_CLOSE
-    syscall
-.vsk_out:
-    pop rbx
-    ret
-
 ; vt_read_active — pread the watch file, parse "ttyN" → eax = N (0 on error).
 vt_read_active:
     mov rax, SYS_LSEEK
@@ -1891,8 +1849,6 @@ exit_handler:
     cmp byte [fbtest_mode], 0
     jne .eh_out
     call drm_teardown
-    mov edi, KD_TEXT
-    call vt_set_kd
 .eh_out:
     mov rax, SYS_EXIT
     xor edi, edi
