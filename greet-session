@@ -68,13 +68,16 @@ for pass in TERM KILL; do
 done
 
 if [ "$CH" = "1" ]; then
-    # frame brings its own DRM + input handling; the script starts tile and
-    # the full ~/.tilerc autostart as $U. GREETER=1 = non-interactive exit
-    # (no "restart gdm?" prompt — control returns to bolt-greet instead).
-    # HOME: bolt-greet's children get HOME=/root; the script builds every
-    # binary path from $HOME (BASE="$HOME/Main/...") — without this it
-    # exits instantly on "missing binary" (the press-1-flicker).
-    GREETER=1 HOME="$UHOME" exec bash "$UHOME/Main/G/GIT-isene/frame/test/desktop-on-frame.sh"
+    # frame brings its own DRM + input handling; the session script starts
+    # tile and the full ~/.tilerc autostart as $U. GREETER=1 =
+    # non-interactive exit (no "restart gdm?" prompt — control returns to
+    # bolt-greet instead). HOME: bolt-greet's children get HOME=/root; the
+    # script builds every binary path from $HOME (BASE="$HOME/Main/...") —
+    # without this it exits instantly on "missing binary" (the
+    # press-1-flicker). start-frame-session is frame's Xsession layer (the
+    # sibling of start-tile-session; formerly frame/test/desktop-on-frame.sh,
+    # which is now a shim to it for the frm/frt test launchers).
+    GREETER=1 HOME="$UHOME" exec bash "$UHOME/bin/start-frame-session"
 fi
 
 # --- X sessions: root Xorg + user session, same privileged/unprivileged
