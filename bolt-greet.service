@@ -14,6 +14,11 @@ TTYReset=yes
 TTYVHangup=yes
 Restart=on-failure
 RestartSec=1
+# The whole desktop session lives in this unit's cgroup. The default
+# OOMPolicy=stop tears down the ENTIRE session when the kernel OOM-kills
+# any one process in it (2026-07-26: a runaway 60GB pty recorder cost the
+# full session). continue = the guilty process dies, the session lives.
+OOMPolicy=continue
 # Clean exit (Esc) must not strand TTY1 as a dead console: hand it to a
 # login getty instead. Conflicts= above stops the getty again whenever
 # the greeter is started back up (sudo systemctl start bolt-greet).
