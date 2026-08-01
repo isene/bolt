@@ -150,7 +150,7 @@ tagline lives in your baked PNG.
   unresponsive app), it bails out with exit 2 rather than half-locking
   the session.
 
-## bolt-greet — the greeter (v0.1.13)
+## bolt-greet — the greeter (v0.1.14)
 
 A third binary: **bolt-greet**, a graphical session chooser that
 replaces the display manager. Pure asm like bolt, but it speaks no
@@ -165,6 +165,21 @@ via evdev. ~25 KB static ELF, zero dependencies.
   BGRX baked by `chasm-bg`)
 - Font: Lat15-Fixed16 (X11 misc-fixed, public domain), baked into
   the binary via `greetfont.inc` — no font files at runtime
+
+**Login gate (v0.1.14).** Choosing a session no longer starts it. The
+greeter first runs `/usr/local/bin/bolt-greet-auth` and starts the
+session only if that exits 0; anything else (wrong finger, no helper,
+helper killed) returns you to the menu. Copy `bolt-greet-auth.example`
+to that path, set the user in it, and `chmod 755` it. The example
+verifies a fingerprint via `fprintd` (enrol with `fprintd-enroll`),
+but the greeter only reads the exit status, so PAM, a smartcard or a
+password prompt drop in without touching the asm.
+
+Locked out? `Esc` still drops to the login getty, which asks for a
+password. That is the intended fallback: an unenrolled reader costs
+you the graphical menu, never the machine. A missing helper refuses
+every login rather than waving them through, so a half-finished
+install fails shut.
 
 On selection it releases DRM master and runs `greet-session <n>`
 (a small bash launcher): choice 1 hands the panel to frame; 2 and 3

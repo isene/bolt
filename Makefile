@@ -70,6 +70,13 @@ install-greeter: bolt-greet
 	install -m 0755 greet-session $(DESTDIR)$(BINDIR)/greet-session
 	install -m 0755 bolt-greet-run $(DESTDIR)$(BINDIR)/bolt-greet-run
 	install -m 0644 bolt-greet.service /etc/systemd/system/bolt-greet.service
+	@# The login gate is NOT installed automatically: it needs a username
+	@# filled in, and silently shipping a default would be a security hole.
+	@# Without it at $(BINDIR)/bolt-greet-auth the greeter refuses every login.
+	install -m 0755 bolt-greet-auth.example $(DESTDIR)$(BINDIR)/bolt-greet-auth.example
+	@echo
+	@echo "  LOGIN GATE: copy bolt-greet-auth.example to $(BINDIR)/bolt-greet-auth,"
+	@echo "  set USER= in it, chmod 755. Until then the greeter blocks every login."
 	@echo
 	@echo "  Greeter installed (NOT enabled). Hand-test from a VT:"
 	@echo "      sudo systemctl stop gdm3 && sudo bolt-greet-run"

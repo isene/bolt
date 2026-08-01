@@ -1,0 +1,23 @@
+#!/bin/sh
+# bolt-greet-auth — the login gate bolt-greet runs before starting a session.
+#
+# Install as /usr/local/bin/bolt-greet-auth (root, 0755) and set USER below.
+# Without it bolt-greet refuses every login, so a broken install fails shut.
+#
+# Contract: exit 0 ONLY when the person at the console proved who they are.
+# Any other exit keeps the greeter on its menu.
+#
+# This example verifies a fingerprint through fprintd (enrol first with
+# `fprintd-enroll`). The exit status of fprintd-verify has varied across
+# versions, so the verdict is taken from the result line instead.
+#
+# Locked out? [Esc] at the greeter drops to the login getty, which asks for
+# a password. That is the intended fallback, not a hole: getty authenticates.
+USER=CHANGEME
+TIMEOUT=25
+
+out=$(timeout "$TIMEOUT" fprintd-verify "$USER" 2>&1)
+case "$out" in
+    *verify-match*) exit 0 ;;
+esac
+exit 1

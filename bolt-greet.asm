@@ -43,6 +43,7 @@
 %define SYS_RT_SIGRETURN  15
 %define SA_RESTORER       0x04000000
 %define SYS_TIME          201
+%define SYS_ACCESS        21
 
 %define O_RDONLY          0
 %define O_WRONLY          1
@@ -109,6 +110,9 @@ str_row0:       db "1  tile on frame", 0
 str_row1:       db "2  tile on X", 0
 str_row2:       db "3  i3 on X", 0
 str_hints:      db "[s] suspend   [p] power off   [Esc] console", 0
+str_auth_wait:  db "Touch the fingerprint reader", 0
+str_auth_fail:  db "Not recognised", 0
+str_auth_gone:  db "Auth gate missing - login blocked", 0
 str_sep:        db "   ", 0
 str_bat:        db "BAT ", 0
 str_pctsp:      db "% ", 0
@@ -133,6 +137,15 @@ path_fbtest_out: db "/tmp/greet_fb.raw", 0
 ; children
 path_systemctl: db "/usr/bin/systemctl", 0
 path_greetsess: db "/usr/local/bin/greet-session", 0
+; Authentication gate. Runs BEFORE any session starts and must exit 0 only
+; when the console user proved who they are (the shipped example verifies a
+; fingerprint via fprintd). A missing or non-executable helper REFUSES: a
+; greeter that opens a session when its gate is absent is worse than one
+; with no gate at all, because it looks guarded. Escape hatch stays [Esc],
+; which drops to the login getty — itself password-gated.
+path_greetauth: db "/usr/local/bin/bolt-greet-auth", 0
+arg_ga0:        db "bolt-greet-auth", 0
+argv_greetauth: dq arg_ga0, 0
 arg_sysctl0:    db "systemctl", 0
 arg_suspend:    db "suspend", 0
 arg_poweroff:   db "poweroff", 0
@@ -165,6 +178,12 @@ log_nomaster:   db "bolt-greet: SET_MASTER failed (another display server runnin
 log_nomaster_len equ $ - log_nomaster
 log_fbtest:     db "bolt-greet: fbtest frame -> /tmp/greet_fb.raw", 10
 log_fbtest_len  equ $ - log_fbtest
+log_auth_ok:    db "bolt-greet: auth ok", 10
+log_auth_ok_len equ $ - log_auth_ok
+log_auth_no:    db "bolt-greet: auth REFUSED", 10
+log_auth_no_len equ $ - log_auth_no
+log_auth_gone:  db "bolt-greet: no auth gate at /usr/local/bin/bolt-greet-auth - refusing", 10
+log_auth_gone_len equ $ - log_auth_gone
 log_launch:     db "bolt-greet: launching session", 10
 log_launch_len  equ $ - log_launch
 log_card:       db "bolt-greet: opened ", 0
@@ -272,6 +291,8 @@ filebuf:        resb 64
 footer_buf:     resb 128
 gs_argv:        resq 3
 wait_status:    resd 1
+auth_msg:       resq 1                  ; 0 = none, else cstr drawn by
+                                        ; render_frame above the session bar
 sig_sa_buf:     resb 32
 lognum_buf:     resb 16
 own_vt:         resd 1                  ; --vt N; 0 = VT gating disabled
@@ -490,8 +511,13 @@ greeter_loop:
     je  .gl_suspend
     cmp eax, 11
     je  .gl_poweroff
-    ; launch session eax(1..3): drop the device, run, re-take
-    mov ebx, eax                        ; close_input clobbers eax/edi
+    ; launch session eax(1..3): prove who you are, THEN drop the device,
+    ; run, re-take. A refused gate falls straight back to the menu.
+    mov ebx, eax                        ; keep the choice; auth clobbers eax
+    call authenticate
+    test eax, eax
+    jz  .gl_iter
+    mov eax, ebx
     call close_input
     mov edi, ebx
     call launch_session
@@ -577,6 +603,66 @@ launch_session:
 ; ============================================================================
 ; run_child_wait — rdi = path, rsi = argv. fork; child execve; parent wait4.
 ; ============================================================================
+; ============================================================================
+; authenticate — the login gate. Renders a prompt, runs bolt-greet-auth to
+; completion and returns eax = 1 only if it exited 0. Everything else (no
+; helper, non-zero exit, killed by a signal, fork failure) returns 0, so the
+; failure direction is always "stay locked". Preserves rbx (the caller keeps
+; the session choice there).
+;
+; The helper owns the how: the shipped example verifies a fingerprint via
+; fprintd. bolt-greet only cares about the exit status, so swapping in PAM,
+; a smartcard or a password prompt needs no change here.
+; ============================================================================
+authenticate:
+    push rbx
+    mov rax, SYS_ACCESS                 ; gate present and executable?
+    lea rdi, [path_greetauth]
+    mov esi, 1                          ; X_OK
+    syscall
+    test rax, rax
+    jnz .au_gone
+    lea rax, [str_auth_wait]            ; show the prompt before blocking
+    mov [auth_msg], rax
+    call render_frame
+    call flush_fb
+    call present_frame
+    lea rdi, [path_greetauth]
+    lea rsi, [argv_greetauth]
+    call run_child_wait
+    mov eax, [wait_status]
+    test eax, 0x7F                      ; low 7 bits set = died on a signal
+    jnz .au_refuse
+    shr eax, 8
+    and eax, 0xFF                       ; exit status
+    test eax, eax
+    jnz .au_refuse
+    mov qword [auth_msg], 0             ; clean menu when the session ends
+    lea rsi, [log_auth_ok]
+    mov rdx, log_auth_ok_len
+    call write_stderr
+    mov eax, 1
+    pop rbx
+    ret
+.au_refuse:
+    lea rax, [str_auth_fail]
+    mov [auth_msg], rax
+    lea rsi, [log_auth_no]
+    mov rdx, log_auth_no_len
+    call write_stderr
+    xor eax, eax
+    pop rbx
+    ret
+.au_gone:
+    lea rax, [str_auth_gone]
+    mov [auth_msg], rax
+    lea rsi, [log_auth_gone]
+    mov rdx, log_auth_gone_len
+    call write_stderr
+    xor eax, eax
+    pop rbx
+    ret
+
 run_child_wait:
     push rbx
     push r12
@@ -916,6 +1002,20 @@ render_frame:
     inc r14d
     jmp .rf_row
 .rf_rows_done:
+    ; auth status ("Touch the fingerprint reader" / "Not recognised"),
+    ; centred just above the session bar. Cold when auth_msg is 0.
+    mov rax, [auth_msg]
+    test rax, rax
+    jz  .rf_no_auth
+    mov edi, [fb_w]
+    shr edi, 1
+    mov esi, [fb_h]
+    sub esi, BOTBAR_H + 34
+    mov rdx, rax
+    mov ecx, 2
+    mov r8d, COL_ACCENT
+    call draw_cstr_centered
+.rf_no_auth:
     pop r15
     pop r14
     pop r13
