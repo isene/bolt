@@ -150,7 +150,7 @@ tagline lives in your baked PNG.
   unresponsive app), it bails out with exit 2 rather than half-locking
   the session.
 
-## bolt-greet — the greeter (v0.1.14)
+## bolt-greet — the greeter (v0.1.15)
 
 A third binary: **bolt-greet**, a graphical session chooser that
 replaces the display manager. Pure asm like bolt, but it speaks no
@@ -166,14 +166,23 @@ via evdev. ~25 KB static ELF, zero dependencies.
 - Font: Lat15-Fixed16 (X11 misc-fixed, public domain), baked into
   the binary via `greetfont.inc` — no font files at runtime
 
-**Login gate (v0.1.14).** Choosing a session no longer starts it. The
-greeter first runs `/usr/local/bin/bolt-greet-auth` and starts the
-session only if that exits 0; anything else (wrong finger, no helper,
-helper killed) returns you to the menu. Copy `bolt-greet-auth.example`
-to that path, set the user in it, and `chmod 755` it. The example
-verifies a fingerprint via `fprintd` (enrol with `fprintd-enroll`),
-but the greeter only reads the exit status, so PAM, a smartcard or a
-password prompt drop in without touching the asm.
+**Login gate (v0.1.15).** Choosing a session no longer starts it. The
+greeter asks who you are first, and behaves exactly like the bolt
+locker does after resume: **touch the reader or type your password**,
+whichever you reach for. Both run at once, and the first to succeed
+wins. Typed characters show as squares; `Backspace` deletes, `Esc`
+returns to the menu.
+
+Both paths go through `/usr/local/bin/bolt-greet-auth`, which the
+greeter runs with no arguments for the fingerprint and with
+`--password` (password on stdin) for the typed one. It starts the
+session only if that exits 0; anything else (wrong finger, wrong
+password, missing helper, helper killed) returns you to the menu.
+Copy `bolt-greet-auth.example` there, set `GREET_USER`, `chmod 755`.
+The example verifies fingerprints via `fprintd` and passwords via
+`bolt-auth`, the same suid helper the locker uses. The greeter only
+reads an exit status, so PAM or a smartcard drops in without touching
+the asm.
 
 Locked out? `Esc` still drops to the login getty, which asks for a
 password. That is the intended fallback: an unenrolled reader costs

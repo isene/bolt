@@ -44,6 +44,9 @@
 %define SA_RESTORER       0x04000000
 %define SYS_TIME          201
 %define SYS_ACCESS        21
+%define SYS_PIPE          22
+%define SYS_DUP2          33
+%define SYS_KILL          62
 
 %define O_RDONLY          0
 %define O_WRONLY          1
@@ -90,6 +93,14 @@
 %define KEY_3       4
 %define KEY_P       25
 %define KEY_S       31
+%define KEY_BSPACE  14
+%define KEY_ENTER   28
+%define KEY_LSHIFT  42
+%define KEY_RSHIFT  54
+%define KEY_KPENTER 96
+%define MAX_PW      128
+%define SQ_SIZE     10                  ; password square + gap, like bolt
+%define SQ_GAP      4
 
 ; ---- layout / colours (memory dwords are X,R,G,B little-endian = B,G,R,X) --
 ; Strip-like top info bar + session selector across the bottom; the
@@ -110,9 +121,40 @@ str_row0:       db "1  tile on frame", 0
 str_row1:       db "2  tile on X", 0
 str_row2:       db "3  i3 on X", 0
 str_hints:      db "[s] suspend   [p] power off   [Esc] console", 0
-str_auth_wait:  db "Touch the fingerprint reader", 0
+str_auth_wait:  db "Touch the reader or type your password", 0
+str_auth_pw:    db "Type your password", 0
 str_auth_fail:  db "Not recognised", 0
+str_auth_busy:  db "Checking...", 0
 str_auth_gone:  db "Auth gate missing - login blocked", 0
+arg_pwmode:     db "--password", 0
+argv_greetpw:   dq arg_ga0, arg_pwmode, 0
+
+; evdev scancode -> ASCII, US layout, index 0..57. Two rows: unshifted and
+; shifted. Only the main typing block is mapped; anything 0 is ignored by
+; the password collector. A greeter cannot ask X for a keymap (there is no
+; X yet), so unlike bolt this table is baked in. Non-US layouts type their
+; password in US positions — the fingerprint path sidesteps that entirely.
+kc_ascii:
+    db 0,0                              ; 0 reserved, 1 Esc
+    db "1","2","3","4","5","6","7","8","9","0","-","="
+    db 0,0                              ; 14 BackSpace, 15 Tab
+    db "q","w","e","r","t","y","u","i","o","p","[","]"
+    db 0,0                              ; 28 Enter, 29 LCtrl
+    db "a","s","d","f","g","h","j","k","l",";","'","`"
+    db 0                                ; 42 LShift
+    db "\","z","x","c","v","b","n","m",",",".","/"
+    db 0,0,0," "                        ; 54 RShift, 55 KP*, 56 LAlt, 57 space
+kc_ascii_shift:
+    db 0,0
+    db "!","@","#","$","%","^","&","*","(",")","_","+"
+    db 0,0
+    db "Q","W","E","R","T","Y","U","I","O","P","{","}"
+    db 0,0
+    db "A","S","D","F","G","H","J","K","L",":",'"',"~"
+    db 0
+    db "|","Z","X","C","V","B","N","M","<",">","?"
+    db 0,0,0," "
+KC_ASCII_MAX equ 57
 str_sep:        db "   ", 0
 str_bat:        db "BAT ", 0
 str_pctsp:      db "% ", 0
@@ -272,7 +314,10 @@ wallpaper_buf:  resb WALL_MAX
 
 input_fds:      resd MAX_INPUTS
 input_fd_count: resd 1
-pollfds:        resb MAX_INPUTS*8
+pollfds:        resb (MAX_INPUTS+2)*8   ; inputs + VT watch + fingerprint pipe
+                                        ; (14 keyboards here; the old
+                                        ; MAX_INPUTS*8 had no room for the
+                                        ; VT slot at a full 16)
 ev_buf:         resb 24*32
 dev_path_buf:   resb 32
 
@@ -293,6 +338,13 @@ gs_argv:        resq 3
 wait_status:    resd 1
 auth_msg:       resq 1                  ; 0 = none, else cstr drawn by
                                         ; render_frame above the session bar
+auth_mode:      resb 1                  ; 1 = collecting a password (draw squares)
+shift_down:     resb 1
+password_buf:   resb MAX_PW
+password_len:   resd 1
+fp_pid:         resd 1                  ; fingerprint child, 0 = none
+fp_pipe_rd:     resd 1                  ; its stdout pipe; EOF = it exited
+pipe_fds:       resd 2
 sig_sa_buf:     resb 32
 lognum_buf:     resb 16
 own_vt:         resd 1                  ; --vt N; 0 = VT gating disabled
@@ -622,34 +674,93 @@ authenticate:
     syscall
     test rax, rax
     jnz .au_gone
-    lea rax, [str_auth_wait]            ; show the prompt before blocking
+    mov dword [password_len], 0
+    mov byte [shift_down], 0
+    mov byte [auth_mode], 1
+    lea rax, [str_auth_wait]
     mov [auth_msg], rax
+    call fp_start                       ; reader runs while you type
+.au_frame:
+    cmp byte [vt_active], 1
+    jne .au_poll
     call render_frame
     call flush_fb
     call present_frame
-    lea rdi, [path_greetauth]
-    lea rsi, [argv_greetauth]
-    call run_child_wait
-    mov eax, [wait_status]
-    test eax, 0x7F                      ; low 7 bits set = died on a signal
-    jnz .au_refuse
-    shr eax, 8
-    and eax, 0xFF                       ; exit status
+.au_poll:
+    call build_pollfds                  ; evdev + VT watch
+    mov ebx, eax
+    cmp dword [fp_pid], 0               ; + the fingerprint child's pipe
+    je  .au_poll_go
+    mov eax, [fp_pipe_rd]
+    mov [pollfds + rbx*8], eax
+    mov word [pollfds + rbx*8 + 4], 1   ; POLLIN (EOF wakes us too)
+    mov word [pollfds + rbx*8 + 6], 0
+    inc ebx
+.au_poll_go:
+    mov esi, ebx
+    mov rax, SYS_POLL
+    lea rdi, [pollfds]
+    mov edx, 30000
+    syscall
+    test rax, rax
+    js  .au_poll                        ; EINTR
+    call vt_check
+    ; fingerprint child finished? (last slot, only present while alive)
+    cmp dword [fp_pid], 0
+    je  .au_keys
+    dec ebx
+    movzx eax, word [pollfds + rbx*8 + 6]
+    test al, 0x19                       ; POLLIN|POLLERR|POLLHUP
+    jz  .au_keys
+    call fp_reap                        ; eax = 1 match, 0 no
     test eax, eax
-    jnz .au_refuse
-    mov qword [auth_msg], 0             ; clean menu when the session ends
+    jnz .au_pass
+    lea rax, [str_auth_pw]              ; reader done; the keyboard remains
+    mov [auth_msg], rax
+.au_keys:
+    call auth_drain                     ; 0 keep going, 1 submit, 2 cancel
+    cmp eax, 1
+    je  .au_check
+    cmp eax, 2
+    je  .au_cancel
+    jmp .au_frame
+.au_check:
+    cmp dword [password_len], 0
+    je  .au_frame                       ; bare Enter: ignore
+    lea rax, [str_auth_busy]
+    mov [auth_msg], rax
+    cmp byte [vt_active], 1
+    jne .au_check_run
+    call render_frame
+    call flush_fb
+    call present_frame
+.au_check_run:
+    call run_pw_check                   ; eax = 1 accepted, 0 rejected
+    mov dword [password_len], 0         ; never keep the buffer around
+    test eax, eax
+    jnz .au_pass
+    lea rax, [str_auth_fail]
+    mov [auth_msg], rax
+    lea rsi, [log_auth_no]
+    mov rdx, log_auth_no_len
+    call write_stderr
+    jmp .au_frame
+.au_pass:
+    call fp_stop                        ; reader goes cold immediately
+    mov byte [auth_mode], 0
+    mov dword [password_len], 0
+    mov qword [auth_msg], 0
     lea rsi, [log_auth_ok]
     mov rdx, log_auth_ok_len
     call write_stderr
     mov eax, 1
     pop rbx
     ret
-.au_refuse:
-    lea rax, [str_auth_fail]
-    mov [auth_msg], rax
-    lea rsi, [log_auth_no]
-    mov rdx, log_auth_no_len
-    call write_stderr
+.au_cancel:
+    call fp_stop
+    mov byte [auth_mode], 0
+    mov dword [password_len], 0
+    mov qword [auth_msg], 0
     xor eax, eax
     pop rbx
     ret
@@ -661,6 +772,320 @@ authenticate:
     call write_stderr
     xor eax, eax
     pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; fp_start — launch the gate in fingerprint mode with its stdout on a pipe,
+; so the poll loop learns it exited without ever blocking on it. Silent
+; no-op if the fork or pipe fails: typing still works.
+; ----------------------------------------------------------------------------
+fp_start:
+    push rbx
+    mov dword [fp_pid], 0
+    mov rax, SYS_PIPE
+    lea rdi, [pipe_fds]
+    syscall
+    test rax, rax
+    js  .fs_done
+    mov rax, SYS_FORK
+    syscall
+    test rax, rax
+    js  .fs_closeboth
+    jnz .fs_parent
+    ; child: stdout -> pipe, drop the read end, exec the gate
+    mov rax, SYS_DUP2
+    mov edi, [pipe_fds + 4]
+    mov esi, 1
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds]
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds + 4]
+    syscall
+    mov rax, SYS_EXECVE
+    lea rdi, [path_greetauth]
+    lea rsi, [argv_greetauth]
+    lea rdx, [child_envp]
+    syscall
+    mov rax, SYS_EXIT
+    mov edi, 127
+    syscall
+.fs_parent:
+    mov [fp_pid], eax
+    mov eax, [pipe_fds]
+    mov [fp_pipe_rd], eax
+    mov rax, SYS_CLOSE                  ; parent never writes
+    mov edi, [pipe_fds + 4]
+    syscall
+    pop rbx
+    ret
+.fs_closeboth:
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds]
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds + 4]
+    syscall
+.fs_done:
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; fp_reap — the child signalled; collect it. eax = 1 only on a clean exit 0.
+; ----------------------------------------------------------------------------
+fp_reap:
+    push rbx
+    mov rax, SYS_CLOSE
+    mov edi, [fp_pipe_rd]
+    syscall
+.fr_wait:
+    mov rax, SYS_WAIT4
+    mov edi, [fp_pid]
+    lea rsi, [wait_status]
+    xor edx, edx
+    xor r10d, r10d
+    syscall
+    cmp rax, -4
+    je  .fr_wait
+    mov dword [fp_pid], 0
+    mov eax, [wait_status]
+    test eax, 0x7F
+    jnz .fr_no
+    shr eax, 8
+    and eax, 0xFF
+    test eax, eax
+    jnz .fr_no
+    mov eax, 1
+    pop rbx
+    ret
+.fr_no:
+    xor eax, eax
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; fp_stop — kill and reap the reader child if it is still running.
+; ----------------------------------------------------------------------------
+fp_stop:
+    cmp dword [fp_pid], 0
+    je  .fst_done
+    mov rax, SYS_KILL
+    mov edi, [fp_pid]
+    mov esi, 15                         ; SIGTERM
+    syscall
+    call fp_reap
+.fst_done:
+    ret
+
+; ----------------------------------------------------------------------------
+; auth_drain — read evdev during authentication. Collects the password,
+; tracks Shift, and returns 0 keep going, 1 submit (Enter), 2 cancel (Esc).
+; Deliberately separate from drain_input: the menu mapping (1/2/3/s/p) must
+; not fire while someone is typing a password containing those letters.
+; ----------------------------------------------------------------------------
+auth_drain:
+    push rbx
+    push r12
+    push r13
+    push r14
+    push r15
+    xor r14d, r14d                      ; result
+    xor ebx, ebx
+.ad_dev:
+    cmp ebx, [input_fd_count]
+    jge .ad_done
+    movzx eax, word [pollfds + rbx*8 + 6]
+    test al, 1                          ; POLLIN
+    jz  .ad_next
+    mov r12d, [input_fds + rbx*4]
+.ad_read:
+    mov rax, SYS_READ
+    mov edi, r12d
+    lea rsi, [ev_buf]
+    mov edx, 24*32
+    syscall
+    test rax, rax
+    jle .ad_next
+    mov r15, rax
+    xor r13d, r13d
+.ad_ev:
+    cmp r13, r15
+    jge .ad_read
+    movzx ecx, word [ev_buf + r13 + 16]
+    cmp ecx, EV_KEY
+    jne .ad_ev_next
+    movzx edx, word [ev_buf + r13 + 18] ; keycode
+    mov ecx, [ev_buf + r13 + 20]        ; 0=release 1=press 2=repeat
+    cmp byte [vt_active], 1
+    jne .ad_ev_next
+    ; Shift tracked on both edges
+    cmp edx, KEY_LSHIFT
+    je  .ad_shift
+    cmp edx, KEY_RSHIFT
+    je  .ad_shift
+    test ecx, ecx                       ; releases carry no text
+    jz  .ad_ev_next
+    cmp edx, KEY_ESC
+    je  .ad_cancel
+    cmp edx, KEY_ENTER
+    je  .ad_submit
+    cmp edx, KEY_KPENTER
+    je  .ad_submit
+    cmp edx, KEY_BSPACE
+    je  .ad_bspace
+    cmp edx, KC_ASCII_MAX
+    ja  .ad_ev_next
+    mov eax, edx
+    cmp byte [shift_down], 0
+    jne .ad_shifted
+    movzx eax, byte [kc_ascii + rax]
+    jmp .ad_have_ch
+.ad_shifted:
+    movzx eax, byte [kc_ascii_shift + rax]
+.ad_have_ch:
+    test al, al
+    jz  .ad_ev_next
+    mov ecx, [password_len]
+    cmp ecx, MAX_PW - 1
+    jae .ad_ev_next
+    mov [password_buf + rcx], al
+    inc dword [password_len]
+    jmp .ad_ev_next
+.ad_shift:
+    test ecx, ecx
+    setne byte [shift_down]
+    jmp .ad_ev_next
+.ad_bspace:
+    mov ecx, [password_len]
+    test ecx, ecx
+    jz  .ad_ev_next
+    dec dword [password_len]
+    jmp .ad_ev_next
+.ad_submit:
+    mov r14d, 1
+    jmp .ad_ev_next
+.ad_cancel:
+    mov r14d, 2
+.ad_ev_next:
+    add r13, 24
+    jmp .ad_ev
+.ad_next:
+    inc ebx
+    jmp .ad_dev
+.ad_done:
+    mov eax, r14d
+    pop r15
+    pop r14
+    pop r13
+    pop r12
+    pop rbx
+    ret
+
+; ----------------------------------------------------------------------------
+; run_pw_check — pipe password_buf to the gate in --password mode.
+; eax = 1 only if it exits 0. The buffer is zeroed here, win or lose, so the
+; cleartext lives no longer than the check itself.
+; ----------------------------------------------------------------------------
+run_pw_check:
+    push rbx
+    push r12
+    mov rax, SYS_PIPE
+    lea rdi, [pipe_fds]
+    syscall
+    test rax, rax
+    js  .pw_fail
+    mov rax, SYS_FORK
+    syscall
+    test rax, rax
+    js  .pw_closeboth
+    jnz .pw_parent
+    ; child: stdin <- pipe
+    mov rax, SYS_DUP2
+    mov edi, [pipe_fds]
+    xor esi, esi
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds]
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds + 4]
+    syscall
+    mov rax, SYS_EXECVE
+    lea rdi, [path_greetauth]
+    lea rsi, [argv_greetpw]
+    lea rdx, [child_envp]
+    syscall
+    mov rax, SYS_EXIT
+    mov edi, 127
+    syscall
+.pw_parent:
+    mov r12d, eax                       ; child pid
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds]
+    syscall
+    mov rax, SYS_WRITE                  ; hand over the password + newline
+    mov edi, [pipe_fds + 4]
+    lea rsi, [password_buf]
+    mov edx, [password_len]
+    syscall
+    mov rax, SYS_WRITE
+    mov edi, [pipe_fds + 4]
+    lea rsi, [str_nl]
+    mov edx, 1
+    syscall
+    mov rax, SYS_CLOSE                  ; EOF so the helper stops reading
+    mov edi, [pipe_fds + 4]
+    syscall
+    call wipe_password
+.pw_wait:
+    mov rax, SYS_WAIT4
+    mov edi, r12d
+    lea rsi, [wait_status]
+    xor edx, edx
+    xor r10d, r10d
+    syscall
+    cmp rax, -4
+    je  .pw_wait
+    mov eax, [wait_status]
+    test eax, 0x7F
+    jnz .pw_no
+    shr eax, 8
+    and eax, 0xFF
+    test eax, eax
+    jnz .pw_no
+    mov eax, 1
+    pop r12
+    pop rbx
+    ret
+.pw_closeboth:
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds]
+    syscall
+    mov rax, SYS_CLOSE
+    mov edi, [pipe_fds + 4]
+    syscall
+.pw_fail:
+    call wipe_password
+.pw_no:
+    call wipe_password
+    xor eax, eax
+    pop r12
+    pop rbx
+    ret
+
+; wipe_password — zero the buffer. Called on every exit path.
+wipe_password:
+    push rdi
+    push rcx
+    push rax
+    lea rdi, [password_buf]
+    mov ecx, MAX_PW
+    xor eax, eax
+    rep stosb
+    pop rax
+    pop rcx
+    pop rdi
     ret
 
 run_child_wait:
@@ -1010,12 +1435,39 @@ render_frame:
     mov edi, [fb_w]
     shr edi, 1
     mov esi, [fb_h]
-    sub esi, BOTBAR_H + 34
+    sub esi, BOTBAR_H + 60
     mov rdx, rax
     mov ecx, 2
     mov r8d, COL_ACCENT
     call draw_cstr_centered
 .rf_no_auth:
+    ; password squares, one per typed character, centred under the prompt
+    cmp byte [auth_mode], 1
+    jne .rf_no_sq
+    mov r14d, [password_len]
+    test r14d, r14d
+    jz  .rf_no_sq
+    mov eax, r14d                       ; total width = n*SQ_SIZE + (n-1)*SQ_GAP
+    imul eax, SQ_SIZE + SQ_GAP
+    sub eax, SQ_GAP
+    mov r15d, [fb_w]
+    sub r15d, eax
+    shr r15d, 1                         ; left edge
+    xor r13d, r13d
+.rf_sq:
+    cmp r13d, r14d
+    jge .rf_no_sq
+    mov edi, r15d
+    mov esi, [fb_h]
+    sub esi, BOTBAR_H + 24
+    mov edx, SQ_SIZE
+    mov ecx, SQ_SIZE
+    mov r8d, COL_ACCENT
+    call fill_rect
+    add r15d, SQ_SIZE + SQ_GAP
+    inc r13d
+    jmp .rf_sq
+.rf_no_sq:
     pop r15
     pop r14
     pop r13
