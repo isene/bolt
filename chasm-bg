@@ -40,4 +40,14 @@ if ! grep -q '^[[:space:]]*bg_image[[:space:]]*=' "$rc" 2>/dev/null; then
     printf 'bg_image = %s\n' "$lockbg" >> "$rc"
     echo "chasm-bg: added 'bg_image = $lockbg' to $rc"
 fi
-echo "chasm-bg: applies on next frame start / bolt lock / greeter draw."
+# Nudge a running frame to re-read ~/.framebg (SIGUSR2, frame >= 0.0.154).
+# Only when the running frame started AFTER the current binary was built:
+# an older frame has no handler and would die on SIGUSR2 (default = Term).
+pid=$(pgrep -x frame | head -1)
+if [ -n "$pid" ] &&
+   [ "$(stat -c %Y "/proc/$pid")" -gt "$(stat -c %Y "$(readlink -f "$HOME/bin/frame")")" ]; then
+    kill -USR2 "$pid"
+    echo "chasm-bg: frame repainted live (SIGUSR2). Bolt/greeter on next draw."
+else
+    echo "chasm-bg: applies on next frame start / bolt lock / greeter draw."
+fi
