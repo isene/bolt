@@ -584,6 +584,7 @@ greeter_loop:
     js  .gl_exit                        ; GPU owned elsewhere → bail out
     mov byte [crtc_bound], 0            ; next present = SETCRTC
     call init_input
+    call load_wallpaper                 ; the session may have rebaked it
     xor ebx, ebx
     jmp .gl_iter
 .gl_suspend:
