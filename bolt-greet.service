@@ -1,7 +1,7 @@
 # bolt-greet — CHasm greeter in place of gdm. Standard display-manager slot:
 #   sudo systemctl disable gdm3
 #   sudo systemctl enable bolt-greet
-#   sudo loginctl enable-linger geir   # user bus exists before first login
+#   sudo loginctl enable-linger <user>   # user bus exists before first login
 [Unit]
 Description=CHasm greeter (bolt-greet)
 Conflicts=getty@tty1.service

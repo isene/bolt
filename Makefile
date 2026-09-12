@@ -76,13 +76,14 @@ install-greeter: bolt-greet
 	install -m 0755 bolt-greet-auth.example $(DESTDIR)$(BINDIR)/bolt-greet-auth.example
 	@echo
 	@echo "  LOGIN GATE: copy bolt-greet-auth.example to $(BINDIR)/bolt-greet-auth,"
-	@echo "  set USER= in it, chmod 755. Until then the greeter blocks every login."
+	@echo "  set GREET_USER= in it, chmod 755. Until then the greeter blocks every"
+	@echo "  login, and greet-session reads the user to run the session as from it."
 	@echo
 	@echo "  Greeter installed (NOT enabled). Hand-test from a VT:"
 	@echo "      sudo systemctl stop gdm3 && sudo bolt-greet-run"
 	@echo "  Make it the boot greeter:"
 	@echo "      sudo systemctl disable gdm3 && sudo systemctl enable bolt-greet"
-	@echo "      sudo loginctl enable-linger geir   # user bus before first login"
+	@echo "      sudo loginctl enable-linger <user>   # user bus before first login"
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/bolt $(DESTDIR)$(BINDIR)/bolt-auth

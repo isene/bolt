@@ -17,9 +17,16 @@ img="${1:?usage: chasm-bg <image>}"
 [ -r "$img" ] || { echo "chasm-bg: not readable: $img" >&2; exit 1; }
 command -v convert >/dev/null || { echo "chasm-bg: ImageMagick convert required" >&2; exit 1; }
 
-# Panel res: ask a running X/frame, else default to this laptop's panel.
+# Panel res: ask a running X/frame; with no display up, read the first
+# connected DRM connector's native mode; else assume a common laptop panel.
 dim=$(xdpyinfo 2>/dev/null | awk '/dimensions:/{print $2; exit}')
-: "${dim:=1920x1200}"
+if [ -z "$dim" ]; then
+    for c in /sys/class/drm/card*-*; do
+        [ -r "$c/status" ] && read -r st < "$c/status" || continue
+        [ "$st" = connected ] && [ -s "$c/modes" ] && read -r dim < "$c/modes" && break
+    done
+fi
+: "${dim:=1920x1080}"
 w=${dim%x*}; h=${dim#*x}
 
 framebg="$HOME/.framebg"
@@ -44,8 +51,9 @@ fi
 # Only when the running frame started AFTER the current binary was built:
 # an older frame has no handler and would die on SIGUSR2 (default = Term).
 pid=$(pgrep -x frame | head -1)
-if [ -n "$pid" ] &&
-   [ "$(stat -c %Y "/proc/$pid")" -gt "$(stat -c %Y "$(readlink -f "$HOME/bin/frame")")" ]; then
+bin=$(readlink -f "$(command -v frame 2>/dev/null)" 2>/dev/null)
+if [ -n "$pid" ] && [ -n "$bin" ] &&
+   [ "$(stat -c %Y "/proc/$pid")" -gt "$(stat -c %Y "$bin")" ]; then
     kill -USR2 "$pid"
     echo "chasm-bg: frame repainted live (SIGUSR2). Bolt/greeter on next draw."
 else

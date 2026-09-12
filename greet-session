@@ -7,12 +7,16 @@
 set -u
 CH="${1:-1}"
 
-# The user the session runs as. Single-user machine; keep it simple.
-U=geir
-UHOME=/home/geir
-UID_N=1000
-
+# The user the session runs as: the one the login gate checks. GREET_USER
+# in bolt-greet-auth is the single place a name is written down.
 ts(){ echo "greet-session: $* [$(date +%T)]" >&2; }
+AUTH=$(command -v bolt-greet-auth || echo /usr/local/bin/bolt-greet-auth)
+U=$(sed -n 's/^GREET_USER=//p' "$AUTH" 2>/dev/null | head -1)
+if [ -z "$U" ] || [ "$U" = CHANGEME ]; then
+    ts "no GREET_USER in $AUTH"; exit 1
+fi
+UHOME=$(getent passwd "$U" | cut -d: -f6)
+UID_N=$(id -u "$U")
 
 # Sessions start in the user's home, like a display manager would. The
 # greeter chain's cwd is / (systemd unit); without this, terminals in the
@@ -68,16 +72,12 @@ for pass in TERM KILL; do
 done
 
 if [ "$CH" = "1" ]; then
-    # frame brings its own DRM + input handling; the session script starts
-    # tile and the full ~/.tilerc autostart as $U. GREETER=1 =
-    # non-interactive exit (no "restart gdm?" prompt — control returns to
-    # bolt-greet instead). HOME: bolt-greet's children get HOME=/root; the
-    # script builds every binary path from $HOME (BASE="$HOME/Main/...") —
-    # without this it exits instantly on "missing binary" (the
-    # press-1-flicker). start-frame-session is frame's Xsession layer (the
-    # sibling of start-tile-session; formerly frame/test/desktop-on-frame.sh,
-    # which is now a shim to it for the frm/frt test launchers).
-    GREETER=1 HOME="$UHOME" exec bash "$UHOME/bin/start-frame-session"
+    # frame brings its own DRM + input handling; chasm-session starts frame
+    # and then tile with the full ~/.tilerc autostart as $U. GREETER=1 =
+    # non-interactive exit: control returns to bolt-greet instead of a
+    # "restart the login screen?" prompt. CHASM_SESSION overrides the
+    # launcher for a local variant of the script.
+    GREETER=1 CHASM_USER="$U" HOME="$UHOME" exec "${CHASM_SESSION:-chasm-session}"
 fi
 
 # --- X sessions: root Xorg + user session, same privileged/unprivileged
@@ -86,7 +86,7 @@ VT="vt$(fgconsole 2>/dev/null || echo 1)"
 XAUTH=/run/bolt-greet.xauth
 rm -f "$XAUTH" "$XAUTH-c" "$XAUTH-l" /tmp/.X11-unix/X0
 # Generate the cookie AS ROOT: xauth creates lock files next to the target,
-# and geir cannot write /run — the runuser variant timed out silently and
+# and the user cannot write /run: the runuser variant timed out silently and
 # left a 0-byte cookie file (every CHasm client then connected cookie-less
 # and tile's phantom auth bytes desynced the server). chown after, so the
 # session's clients can read it.
@@ -149,7 +149,9 @@ if [ "$CH" = "3" ]; then
     # run it plain — wrapping it here ran xps14 twice.
     SESSION=(/usr/bin/i3)
 else
-    SESSION=("$UHOME/bin/start-tile-session")
+    # chasm-session sees DISPLAY and a non-root uid, so it takes its
+    # login-screen path: env fixes, then exec tile.
+    SESSION=("${CHASM_SESSION:-chasm-session}")
 fi
 
 # setsid: the session gets its own process group so we can kill EVERYTHING
