@@ -2673,10 +2673,36 @@ drm_try_open:
     xor edx, edx
     syscall
     test rax, rax
-    jns .dt_ok
+    jns .dt_opened
+.dt_next:
     inc ebx
     jmp .dt_loop
+.dt_opened:
+    ; Skip a card with no connectors (a discrete GPU wired to nothing; the
+    ; NVIDIA card became card0 on kernel 7.0.0-31 and the greeter only got
+    ; the panel's card by winning a module-load race).
+    push rax
+    lea rdi, [drm_res_buf]
+    xor eax, eax
+    mov ecx, 8
+    rep stosq
+    mov rax, SYS_IOCTL
+    mov rdi, [rsp]
+    mov esi, DRM_IOCTL_MODE_GETRESOURCES
+    lea rdx, [drm_res_buf]
+    syscall
+    test rax, rax
+    js .dt_skip
+    cmp dword [drm_res_buf + 40], 0          ; count_connectors
+    jne .dt_ok
+.dt_skip:
+    mov rax, SYS_CLOSE
+    mov rdi, [rsp]
+    syscall
+    pop rax
+    jmp .dt_next
 .dt_ok:
+    pop rax
     pop rbx
     ret
 .dt_miss:

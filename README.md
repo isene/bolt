@@ -150,7 +150,7 @@ tagline lives in your baked PNG.
   unresponsive app), it bails out with exit 2 rather than half-locking
   the session.
 
-## bolt-greet — the greeter (v0.1.15)
+## bolt-greet — the greeter (v0.1.16)
 
 A third binary: **bolt-greet**, a graphical session chooser that
 replaces the display manager. Pure asm like bolt, but it speaks no
@@ -165,6 +165,8 @@ via evdev. ~25 KB static ELF, zero dependencies.
   BGRX baked by `chasm-bg`)
 - Font: Lat15-Fixed16 (X11 misc-fixed, public domain), baked into
   the binary via `greetfont.inc` — no font files at runtime
+- Opens the first DRM card that has connectors (v0.1.16). A discrete
+  GPU wired to nothing can be card0 when its module loads first.
 
 **Login gate (v0.1.15).** Choosing a session no longer starts it. The
 greeter asks who you are first, and behaves exactly like the bolt
