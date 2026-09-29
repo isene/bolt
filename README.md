@@ -2,7 +2,7 @@
 
 <img src="img/bolt.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.13-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-libcrypt-brightgreen) ![Binary](https://img.shields.io/badge/binary-~24KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600)
+![Version](https://img.shields.io/badge/version-0.1.14-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-libcrypt-brightgreen) ![Binary](https://img.shields.io/badge/binary-~24KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600)
 
 A small, fast screen locker for the **CHasm** (CHange to ASM) desktop
 suite. Two binaries:

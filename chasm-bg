@@ -48,12 +48,17 @@ if ! grep -q '^[[:space:]]*bg_image[[:space:]]*=' "$rc" 2>/dev/null; then
     echo "chasm-bg: added 'bg_image = $lockbg' to $rc"
 fi
 # Nudge a running frame to re-read ~/.framebg (SIGUSR2, frame >= 0.0.154).
-# Only when the running frame started AFTER the current binary was built:
-# an older frame has no handler and would die on SIGUSR2 (default = Term).
+# An older frame has no handler and would die of it, so signal only a frame
+# whose SigCgt mask shows SIGUSR2 (12, bit 11) caught. The old test, "frame
+# started after its binary was built", skipped every repaint after a rebuild.
 pid=$(pgrep -x frame | head -1)
-bin=$(readlink -f "$(command -v frame 2>/dev/null)" 2>/dev/null)
-if [ -n "$pid" ] && [ -n "$bin" ] &&
-   [ "$(stat -c %Y "/proc/$pid")" -gt "$(stat -c %Y "$bin")" ]; then
+cgt=0
+if [ -n "$pid" ] && [ -r "/proc/$pid/status" ]; then
+    while read -r k v; do
+        if [ "$k" = SigCgt: ]; then cgt=$((16#$v)); fi
+    done < "/proc/$pid/status"
+fi
+if [ $((cgt & 0x800)) -ne 0 ]; then
     kill -USR2 "$pid"
     echo "chasm-bg: frame repainted live (SIGUSR2). Bolt/greeter on next draw."
 else
