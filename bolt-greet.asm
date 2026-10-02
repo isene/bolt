@@ -1,7 +1,7 @@
 ; ============================================================================
 ; bolt-greet — pure x86_64 asm graphical greeter (session chooser) for the
 ; CHasm suite. No libc, no X11, single static ELF. Runs on a bare VT via
-; DRM/KMS (frame's modeset path) + evdev, draws the ~/.framebg wallpaper with
+; DRM/KMS (frame's modeset path) + evdev, draws the login user's wallpaper with
 ; a session menu, and on selection releases DRM and runs greet-session with
 ; the chosen session. When the session exits it re-inits DRM and shows the
 ; menu again — the login gate that replaces gdm.
@@ -168,7 +168,9 @@ wday_names:     db "Thu",0, "Fri",0, "Sat",0, "Sun",0, "Mon",0, "Tue",0, "Wed",0
 mon_names:      db "Jan",0, "Feb",0, "Mar",0, "Apr",0, "May",0, "Jun",0
                 db "Jul",0, "Aug",0, "Sep",0, "Oct",0, "Nov",0, "Dec",0
 
-path_framebg:   db "/home/geir/.framebg", 0
+; The greeter runs as root before anyone has logged in, so it has no home
+; to look in. This is a link to the login user's ~/.framebg, made at install.
+path_framebg:   db "/usr/local/share/chasm/greeter.bg", 0
 input_dev_pre:  db "/dev/input/event", 0
 path_bat0_cap:  db "/sys/class/power_supply/BAT0/capacity", 0
 path_bat0_stat: db "/sys/class/power_supply/BAT0/status", 0
@@ -2066,7 +2068,7 @@ atoi_buf:
     ret
 
 ; ============================================================================
-; load_wallpaper — read ~/.framebg; sets wallpaper_ok if size==w*h*4.
+; load_wallpaper — read path_framebg; sets wallpaper_ok if size==w*h*4.
 ; ============================================================================
 load_wallpaper:
     push rbx

@@ -218,8 +218,7 @@ x11_socket_prefix_len   equ $ - x11_socket_prefix - 1
 default_lockrc_name:    db "/.lockrc", 0
 logo_path_suffix:       db "/.cache/chasm-bolt/logo.rgba", 0
 logo_path_install:      db "/usr/local/share/bolt/logo.rgba", 0
-logo_path_dev:          db "/home/geir/Main/G/GIT-isene/bolt/img/logo.rgba", 0
-logo_dim_path_dev:      db "/home/geir/Main/G/GIT-isene/bolt/img/logo.dim", 0
+logo_dim_path_install:  db "/usr/local/share/bolt/logo.dim", 0
 
 default_tagline:        db "Make it Simple", 0
 default_tagline_len     equ $ - default_tagline - 1
@@ -1366,21 +1365,14 @@ open_font:
     ret
 
 ; ----------------------------------------------------------------------------
-; load_logo — mmap img/logo.rgba (read-only) so render can blit it.
-; Tries the dev path first, then the install path. Sets logo_addr=0 and
+; load_logo — mmap the installed logo.rgba (read-only) so render can blit
+; it; logo.dim beside it gives the size. Sets logo_addr=0 and
 ; logo_w=logo_h=0 on failure (render falls back gracefully).
 ; ----------------------------------------------------------------------------
 load_logo:
     push rbx
     push r12
     push r13
-    ; First try the dev path.
-    mov rax, SYS_OPEN
-    lea rdi, [logo_path_dev]
-    xor esi, esi
-    syscall
-    test rax, rax
-    jns .ll_have_fd
     mov rax, SYS_OPEN
     lea rdi, [logo_path_install]
     xor esi, esi
@@ -1412,7 +1404,7 @@ load_logo:
     mov [logo_addr], rax
     ; Read the .dim sidecar to get width / height.
     mov rax, SYS_OPEN
-    lea rdi, [logo_dim_path_dev]
+    lea rdi, [logo_dim_path_install]
     xor esi, esi
     syscall
     test rax, rax

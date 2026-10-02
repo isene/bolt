@@ -53,6 +53,10 @@ install: bolt bolt-auth
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 0755 bolt $(DESTDIR)$(BINDIR)/bolt
 	install -m 4755 -o root -g root bolt-auth $(DESTDIR)$(BINDIR)/bolt-auth
+	@# The lock screen logo, when `make logo` has baked one.
+	@if [ -f img/logo.rgba ] && [ -f img/logo.dim ]; then \
+	    install -d $(DESTDIR)$(PREFIX)/share/bolt && \
+	    install -m 0644 img/logo.rgba img/logo.dim $(DESTDIR)$(PREFIX)/share/bolt/; fi
 	@echo
 	@echo "  bolt installed. The auth helper is suid root (mode 4755):"
 	@ls -la $(DESTDIR)$(BINDIR)/bolt-auth
@@ -78,6 +82,11 @@ install-greeter: bolt-greet
 	@echo "  LOGIN GATE: copy bolt-greet-auth.example to $(BINDIR)/bolt-greet-auth,"
 	@echo "  set GREET_USER= in it, chmod 755. Until then the greeter blocks every"
 	@echo "  login, and greet-session reads the user to run the session as from it."
+	@echo
+	@echo "  WALLPAPER: the greeter draws $(PREFIX)/share/chasm/greeter.bg."
+	@echo "  Link it to the login user's baked wallpaper:"
+	@echo "      sudo mkdir -p $(PREFIX)/share/chasm"
+	@echo "      sudo ln -sfn /home/<user>/.framebg $(PREFIX)/share/chasm/greeter.bg"
 	@echo
 	@echo "  Greeter installed (NOT enabled). Hand-test from a VT:"
 	@echo "      sudo systemctl stop gdm3 && sudo bolt-greet-run"

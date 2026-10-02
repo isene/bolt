@@ -2,7 +2,7 @@
 
 <img src="img/bolt.svg" align="left" width="150" height="150">
 
-![Version](https://img.shields.io/badge/version-0.1.14-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-libcrypt-brightgreen) ![Binary](https://img.shields.io/badge/binary-~24KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600)
+![Version](https://img.shields.io/badge/version-0.1.15-blue) ![Assembly](https://img.shields.io/badge/language-x86__64%20Assembly-purple) ![License](https://img.shields.io/badge/license-Unlicense-green) ![Platform](https://img.shields.io/badge/platform-Linux%20x86__64-blue) ![Dependencies](https://img.shields.io/badge/dependencies-libcrypt-brightgreen) ![Binary](https://img.shields.io/badge/binary-~24KB-orange) ![X11](https://img.shields.io/badge/protocol-X11%20wire-ff6600)
 
 A small, fast screen locker for the **CHasm** (CHange to ASM) desktop
 suite. Two binaries:
@@ -150,7 +150,7 @@ tagline lives in your baked PNG.
   unresponsive app), it bails out with exit 2 rather than half-locking
   the session.
 
-## bolt-greet — the greeter (v0.1.16)
+## bolt-greet — the greeter (v0.1.17)
 
 A third binary: **bolt-greet**, a graphical session chooser that
 replaces the display manager. Pure asm like bolt, but it speaks no
@@ -161,8 +161,11 @@ via evdev. ~25 KB static ELF, zero dependencies.
 - Press `1`/`2`/`3` to launch: `1` tile on [frame](https://github.com/isene/frame),
   `2` tile on X, `3` i3 on X (safeguard)
 - `s` suspend, `p` power off, `Esc` exit to console
-- Shows clock, date, battery; wallpaper from `~/.framebg` (same raw
-  BGRX baked by `chasm-bg`)
+- Shows clock, date, battery; wallpaper from
+  `/usr/local/share/chasm/greeter.bg`, a link to the login user's
+  `~/.framebg` (same raw BGRX baked by `chasm-bg`). The greeter runs
+  before anyone has logged in, so it cannot look in a home folder:
+  `sudo ln -sfn ~/.framebg /usr/local/share/chasm/greeter.bg`
 - Font: Lat15-Fixed16 (X11 misc-fixed, public domain), baked into
   the binary via `greetfont.inc` — no font files at runtime
 - Opens the first DRM card that has connectors (v0.1.16). A discrete
